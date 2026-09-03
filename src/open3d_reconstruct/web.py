@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -35,6 +36,13 @@ WEB_HOST = "127.0.0.1"
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_LOG_LINES = 1200
+MAX_MATCHING_EVENTS = 2000
+MAX_RECORDING_UPLOAD_BYTES = 256 * 1024**3
+RECORDING_UPLOAD_CHUNK_BYTES = 4 * 1024**2
+MIN_FREE_STORAGE_BYTES = 256 * 1024**2
+MESH_PREVIEW_TARGET_TRIANGLES = 120_000
+MESH_PREVIEW_CLUSTER_RESOLUTION = 180
+WEB_MATCH_PREFIX = "__OPEN3D_WEB_MATCH__ "
 PIPELINE_STEPS = (
     ("extract", "提取 RGB-D 帧"),
     ("make", "生成局部片段"),
@@ -62,6 +70,24 @@ HARDWARE: dict[str, dict[str, str]] = {
     },
 }
 
+RECONSTRUCTION_PARAMETER_RULES: dict[str, dict[str, Any]] = {
+    "n_frames_per_fragment": {
+        "kind": "integer",
+        "minimum": 30,
+        "maximum": 300,
+    },
+    "n_keyframes_per_n_frame": {
+        "kind": "integer",
+        "minimum": 2,
+        "maximum": 30,
+    },
+    "depth_max": {"kind": "number", "minimum": 0.5, "maximum": 10.0},
+    "voxel_size": {"kind": "number", "minimum": 0.01, "maximum": 0.2},
+    "depth_diff_max": {"kind": "number", "minimum": 0.01, "maximum": 0.3},
+    "icp_method": {"kind": "choice", "choices": {"point_to_plane", "color"}},
+    "global_registration": {"kind": "choice", "choices": {"fgr", "ransac"}},
+}
+
 
 class WebActionError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.CONFLICT) -> None:
@@ -76,8 +102,9 @@ def _now_iso() -> str:
 def _display_path(path: Path | None) -> str | None:
     if path is None:
         return None
+    absolute = Path(os.path.abspath(path))
     try:
-        return str(path.resolve().relative_to(ROOT.resolve()))
+        return str(absolute.relative_to(ROOT.resolve()))
     except ValueError:
         return str(path.resolve())
 
@@ -105,6 +132,36 @@ def _is_nonempty_file(path: Path | None) -> bool:
         return False
 
 
+def _path_tree_size(path: Path) -> int:
+    """Return logical content size without following directory symlinks."""
+    try:
+        if path.is_symlink():
+            return 0
+        if path.is_file():
+            return path.stat().st_size
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total += _path_tree_size(Path(entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return total
+    return total
+
+
 def _clean_recording_name(value: object) -> str:
     if value is None or not str(value).strip():
         return "web-" + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -125,6 +182,89 @@ def _clean_recording_name(value: object) -> str:
     return name
 
 
+def _recording_import_spec(
+    filename: object, hardware: object = None
+) -> tuple[str, str, str]:
+    raw_name = str(filename or "").strip()
+    if not raw_name:
+        raise WebActionError("请选择 MKV 或 BAG 录制文件", HTTPStatus.BAD_REQUEST)
+    basename = Path(raw_name).name
+    extension = Path(basename).suffix.lower()
+    if extension == ".mkv":
+        hardware_id = "azure-kinect"
+    elif extension == ".bag":
+        requested_hardware = str(hardware or "")
+        hardware_id = (
+            requested_hardware
+            if requested_hardware in {"d435", "d435i"}
+            else "d435"
+        )
+    else:
+        raise WebActionError(
+            "仅支持 Azure Kinect MKV 或 RealSense BAG 录制文件",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+        )
+    return _clean_recording_name(basename), extension, hardware_id
+
+
+def _validated_reconstruction_parameters(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise WebActionError("重建参数必须是 JSON 对象", HTTPStatus.BAD_REQUEST)
+    unknown = sorted(set(value) - set(RECONSTRUCTION_PARAMETER_RULES))
+    if unknown:
+        raise WebActionError(
+            f"不支持的重建参数: {', '.join(unknown)}",
+            HTTPStatus.BAD_REQUEST,
+        )
+
+    result: dict[str, Any] = {}
+    for key, rule in RECONSTRUCTION_PARAMETER_RULES.items():
+        if key not in value:
+            continue
+        raw = value[key]
+        kind = rule["kind"]
+        if kind == "integer":
+            if not isinstance(raw, int) or isinstance(raw, bool):
+                raise WebActionError(f"重建参数 {key} 必须是整数", HTTPStatus.BAD_REQUEST)
+            parsed: Any = raw
+        elif kind == "number":
+            if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+                raise WebActionError(f"重建参数 {key} 必须是数值", HTTPStatus.BAD_REQUEST)
+            parsed = float(raw)
+            if not math.isfinite(parsed):
+                raise WebActionError(
+                    f"重建参数 {key} 必须是有限数值",
+                    HTTPStatus.BAD_REQUEST,
+                )
+        else:
+            if not isinstance(raw, str) or raw not in rule["choices"]:
+                choices = ", ".join(sorted(rule["choices"]))
+                raise WebActionError(
+                    f"重建参数 {key} 必须是以下值之一: {choices}",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            result[key] = raw
+            continue
+
+        if parsed < rule["minimum"] or parsed > rule["maximum"]:
+            raise WebActionError(
+                f"重建参数 {key} 必须在 {rule['minimum']} 到 {rule['maximum']} 之间",
+                HTTPStatus.BAD_REQUEST,
+            )
+        result[key] = parsed
+
+    frames = result.get("n_frames_per_fragment")
+    keyframe_interval = result.get("n_keyframes_per_n_frame")
+    if frames is not None and keyframe_interval is not None and keyframe_interval > frames:
+        raise WebActionError(
+            "关键帧间隔不能大于每个局部片段的帧数",
+            HTTPStatus.BAD_REQUEST,
+        )
+    return result
+
+
 class ControlCenter:
     """Owns the single local camera/conversion process used by the web page."""
 
@@ -132,6 +272,8 @@ class ControlCenter:
         self.launcher = (launcher or (ROOT / "open3d-reconstruct")).resolve()
         self._lock = threading.RLock()
         self._device_lock = threading.Lock()
+        self._file_picker_lock = threading.Lock()
+        self._mesh_preview_lock = threading.Lock()
         self._logs: deque[dict[str, Any]] = deque(maxlen=MAX_LOG_LINES)
         self._revision = 0
         self._generation = 0
@@ -149,14 +291,20 @@ class ControlCenter:
         self._conversion_started_at: str | None = None
         self._conversion_finished_at: str | None = None
         self._conversion_progress: dict[str, Any] | None = None
+        self._reconstruction_settings: dict[str, Any] | None = None
         self._live_dir: Path | None = None
         self._device_cache: dict[str, Any] | None = None
         self._device_cache_at = 0.0
+        self._import_temp: Path | None = None
+        self._import_target: Path | None = None
+        self._import_expected_bytes = 0
+        self._import_received_bytes = 0
 
     def _touch_locked(self) -> None:
         self._revision += 1
 
     def _reset_conversion_progress_locked(self) -> None:
+        now = time.monotonic()
         self._conversion_progress = {
             "stage": "extract",
             "stage_index": 0,
@@ -166,11 +314,158 @@ class ControlCenter:
             "detail": "正在打开录制文件并准备提取帧",
             "processed": 0,
             "total": None,
+            "settings": dict(self._reconstruction_settings or {}),
+            "_started_monotonic": now,
+            "_stage_started_monotonic": now,
+            "_last_output_monotonic": now,
+            "_matching_events": [],
+            "_matching_active": {},
+            "_matching_seen": set(),
+            "_matching_attempted": 0,
+            "_matching_succeeded": 0,
+            "_matching_failed": 0,
+            "_matching_information_max": 0.0,
+            "_matching_last": None,
+            "_matching_expected": None,
         }
+
+    @staticmethod
+    def _expected_matching_pairs(
+        frame_count: int,
+        frames_per_fragment: int,
+        keyframe_interval: int,
+    ) -> int:
+        expected = 0
+        for first in range(0, frame_count, frames_per_fragment):
+            last = min(first + frames_per_fragment, frame_count)
+            fragment_frames = last - first
+            expected += max(0, fragment_frames - 1)
+            keyframes = sum(
+                1 for frame in range(first, last)
+                if frame % keyframe_interval == 0
+            )
+            expected += keyframes * (keyframes - 1) // 2
+        return expected
+
+    def _update_matching_plan_locked(
+        self, progress: dict[str, Any], frame_count: int
+    ) -> None:
+        settings = progress.get("settings") or {}
+        frames_per_fragment = max(
+            1, int(settings.get("n_frames_per_fragment", 100))
+        )
+        keyframe_interval = max(
+            1, int(settings.get("n_keyframes_per_n_frame", 5))
+        )
+        progress["_matching_expected"] = self._expected_matching_pairs(
+            frame_count,
+            frames_per_fragment,
+            keyframe_interval,
+        )
+
+    def _observe_matching_event_locked(
+        self, progress: dict[str, Any], message: str
+    ) -> bool:
+        if not message.startswith(WEB_MATCH_PREFIX):
+            return False
+        try:
+            payload = json.loads(message[len(WEB_MATCH_PREFIX):])
+        except (json.JSONDecodeError, TypeError):
+            return True
+        if not isinstance(payload, dict):
+            return True
+
+        status = payload.get("status")
+        kind = payload.get("kind")
+        if status not in {"running", "result"} or kind not in {"odometry", "loop"}:
+            return True
+        indices: dict[str, int] = {}
+        for field in ("fragment", "source", "target"):
+            value = payload.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return True
+            indices[field] = value
+        if indices["target"] <= indices["source"]:
+            return True
+
+        key = (
+            f"{indices['fragment']}:{indices['source']}:"
+            f"{indices['target']}:{kind}"
+        )
+        event: dict[str, Any] = {
+            **indices,
+            "kind": kind,
+        }
+        active = progress.setdefault("_matching_active", {})
+        if status == "running":
+            active[key] = event
+            progress["preview_frame"] = indices["target"]
+            progress["fragment_current"] = indices["fragment"] + 1
+            progress["detail"] = (
+                f"片段 {indices['fragment'] + 1}/"
+                f"{progress.get('fragment_total') or '—'}：正在估计帧 "
+                f"{indices['source']} ↔ {indices['target']} 的位姿"
+            )
+            return True
+
+        active.pop(key, None)
+        seen = progress.setdefault("_matching_seen", set())
+        if key in seen:
+            return True
+        seen.add(key)
+        success = payload.get("success") is True
+
+        def finite_metric(name: str) -> float:
+            raw = payload.get(name, 0.0)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                return 0.0
+            value = float(raw)
+            return max(0.0, value) if math.isfinite(value) else 0.0
+
+        event.update(
+            success=success,
+            information=finite_metric("information") if success else 0.0,
+            translation_m=finite_metric("translation_m") if success else 0.0,
+            rotation_deg=finite_metric("rotation_deg") if success else 0.0,
+        )
+        events = progress.setdefault("_matching_events", [])
+        events.append(event)
+        if len(events) > MAX_MATCHING_EVENTS:
+            del events[:len(events) - MAX_MATCHING_EVENTS]
+        progress["_matching_attempted"] = int(
+            progress.get("_matching_attempted") or 0
+        ) + 1
+        outcome_key = "_matching_succeeded" if success else "_matching_failed"
+        progress[outcome_key] = int(progress.get(outcome_key) or 0) + 1
+        progress["_matching_information_max"] = max(
+            float(progress.get("_matching_information_max") or 0.0),
+            event["information"],
+        )
+        progress["_matching_last"] = event
+        progress["preview_frame"] = indices["target"]
+        progress["fragment_current"] = indices["fragment"] + 1
+        expected = progress.get("_matching_expected")
+        completed_text = (
+            f"{progress['_matching_attempted']}/{expected}"
+            if isinstance(expected, int) and expected > 0
+            else str(progress["_matching_attempted"])
+        )
+        outcome = "成功" if success else "失败"
+        progress["detail"] = (
+            f"已计算 {completed_text} 组帧对；帧 "
+            f"{indices['source']} ↔ {indices['target']} 匹配{outcome}"
+        )
+        return True
 
     def _observe_conversion_output_locked(self, message: str) -> None:
         progress = self._conversion_progress
         if self._task != "convert" or progress is None:
+            return
+
+        now = time.monotonic()
+        progress["_last_output_monotonic"] = now
+
+        if self._observe_matching_event_locked(progress, message):
             return
 
         extracted = re.search(r"已提取\s+(\d+)\s+帧", message)
@@ -203,6 +498,10 @@ class ControlCenter:
             count = int(dataset_ready.group(1))
             progress["frame_count"] = count
             progress["detail"] = f"数据集检查通过，共 {count} 帧"
+            settings = progress.get("settings") or {}
+            frames_per_fragment = int(settings.get("n_frames_per_fragment", 100))
+            progress["fragment_total"] = max(1, math.ceil(count / frames_per_fragment))
+            self._update_matching_plan_locked(progress, count)
             return
 
         stage_header = re.search(r"\[(\d+)/(\d+)\]\s+(.+?)\s*$", message)
@@ -221,20 +520,118 @@ class ControlCenter:
                     detail=f"正在执行：{label}",
                     processed=0,
                     total=None,
+                    _stage_started_monotonic=now,
                 )
             return
 
+        fragment_plan = re.search(
+            r"局部片段计划：\s*(\d+)\s*帧，\s*(\d+)\s*个片段，"
+            r"使用\s*(\d+)\s*个并行进程",
+            message,
+        )
+        if fragment_plan:
+            frame_count = int(fragment_plan.group(1))
+            fragment_total = int(fragment_plan.group(2))
+            workers = int(fragment_plan.group(3))
+            progress.update(
+                stage="make",
+                stage_index=1,
+                label=PIPELINE_STEPS[1][1],
+                detail=(
+                    f"已分配 {fragment_total} 个局部片段，"
+                    f"{workers} 个进程并行计算"
+                ),
+                frame_count=frame_count,
+                fragment_total=fragment_total,
+                fragment_completed=0,
+                worker_count=workers,
+                processed=0,
+                total=fragment_total,
+            )
+            self._update_matching_plan_locked(progress, frame_count)
+            return
+
+        fragment_started = re.search(
+            r"片段\s+(\d+)\s*/\s*(\d+)\s+开始：帧\s+(\d+)\s*[—-]\s*(\d+)",
+            message,
+        )
+        if fragment_started and progress.get("stage") == "make":
+            current = int(fragment_started.group(1))
+            total = int(fragment_started.group(2))
+            first_frame = int(fragment_started.group(3))
+            last_frame = int(fragment_started.group(4))
+            progress.update(
+                fragment_current=current,
+                fragment_total=total,
+                preview_frame=first_frame,
+                detail=(
+                    f"片段 {current}/{total} 已开始，"
+                    f"正在处理帧 {first_frame}–{last_frame}"
+                ),
+            )
+            return
+
+        fragment_done = re.search(
+            r"片段完成\s+(\d+)\s*/\s*(\d+)（片段\s+(\d+)）",
+            message,
+        )
+        if fragment_done and progress.get("stage") == "make":
+            completed = int(fragment_done.group(1))
+            total = int(fragment_done.group(2))
+            fragment_id = int(fragment_done.group(3))
+            progress.update(
+                fragment_completed=completed,
+                fragment_total=total,
+                processed=completed,
+                total=total,
+                detail=(
+                    f"局部片段已完成 {completed}/{total}"
+                    f"（刚完成片段 {fragment_id}）"
+                ),
+            )
+            return
+
+        if message.startswith("making fragments from RGBD sequence"):
+            fragment_total = progress.get("fragment_total")
+            progress.update(
+                stage="make",
+                stage_index=1,
+                label=PIPELINE_STEPS[1][1],
+                detail=(
+                    f"正在启动局部片段计算，共 {fragment_total} 个片段"
+                    if isinstance(fragment_total, int)
+                    else (
+                        "正在启动局部片段计算；"
+                        "首次启动子进程可能需要一些时间"
+                    )
+                ),
+                processed=0,
+                total=fragment_total,
+            )
+            return
+
         integration = re.search(
-            r"integrate rgbd frame\s+(\d+)\s+\((\d+) of (\d+)\)", message
+            r"(?:Fragment\s+(\d+)\s+/\s+(\d+)\s+::\s+)?"
+            r"integrate rgbd frame\s+(\d+)\s+\((\d+) of (\d+)\)",
+            message,
         )
         if integration:
-            frame_index = int(integration.group(1))
-            local_current = int(integration.group(2))
-            local_total = int(integration.group(3))
-            progress["detail"] = (
-                f"正在融合 RGB-D 帧 {frame_index}（当前片段 "
-                f"{local_current}/{local_total}）"
-            )
+            fragment_index = integration.group(1)
+            fragment_last = integration.group(2)
+            frame_index = int(integration.group(3))
+            local_current = int(integration.group(4))
+            local_total = int(integration.group(5))
+            progress["preview_frame"] = frame_index
+            if progress.get("stage") == "make" and fragment_index is not None:
+                progress["detail"] = (
+                    f"片段 {int(fragment_index) + 1}/{int(fragment_last) + 1}："
+                    f"正在融合帧 {frame_index}（{local_current}/{local_total}）"
+                )
+            else:
+                progress["detail"] = (
+                    f"正在融合 RGB-D 帧 {frame_index}（当前片段 "
+                    f"{local_current}/{local_total}）"
+                )
             frame_count = progress.get("frame_count")
             if progress.get("stage") == "integrate" and isinstance(frame_count, int):
                 progress["processed"] = min(frame_index + 1, frame_count)
@@ -242,10 +639,14 @@ class ControlCenter:
             return
 
         fragment_match = re.search(
-            r"Fragment\s+(\d+)\s+/\s+(\d+)\s+::\s+RGBD matching between frame\s*:\s*(\d+) and (\d+)",
+            r"Fragment\s+(\d+)\s+/\s+(\d+)\s+::\s+"
+            r"RGBD matching between frame\s*:\s*(\d+) and (\d+)",
             message,
         )
         if fragment_match and progress.get("stage") == "make":
+            progress["preview_frame"] = int(fragment_match.group(4))
+            progress["fragment_current"] = int(fragment_match.group(1)) + 1
+            progress["fragment_total"] = int(fragment_match.group(2)) + 1
             progress["detail"] = (
                 f"片段 {int(fragment_match.group(1)) + 1}/"
                 f"{int(fragment_match.group(2)) + 1}：匹配帧 "
@@ -266,13 +667,14 @@ class ControlCenter:
             message = message[:8000] + "…"
         with self._lock:
             self._observe_conversion_output_locked(message)
-            self._logs.append(
-                {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "level": level,
-                    "message": message,
-                }
-            )
+            if not message.startswith(WEB_MATCH_PREFIX):
+                self._logs.append(
+                    {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "level": level,
+                        "message": message,
+                    }
+                )
             self._touch_locked()
 
     def _new_paths_locked(self, requested_name: object, extension: str) -> tuple[Path, Path]:
@@ -292,7 +694,7 @@ class ControlCenter:
             recording = RECORDINGS_DIR / f"{candidate}{extension}"
             dataset = DATASETS_DIR / candidate
             partials = tuple(DATASETS_DIR.glob(f".{candidate}.partial-*"))
-            if not recording.exists() and not dataset.exists() and not partials:
+            if not os.path.lexists(recording) and not dataset.exists() and not partials:
                 return recording.resolve(), dataset.resolve()
             suffix += 1
             candidate = f"{base}-{suffix}"
@@ -401,7 +803,7 @@ class ControlCenter:
         if returncode == 0 and valid:
             self._phase = "recorded"
             self._error = None
-            self._append_log("录制文件已封装完成，可以开始转换。", level="success")
+            self._append_log("录制文件已封装完成，可以开始重建。", level="success")
             return
         self._phase = "error"
         if valid:
@@ -409,6 +811,564 @@ class ControlCenter:
         else:
             self._error = f"录制失败（退出代码 {returncode}），没有生成有效录制文件"
         self._append_log(self._error, level="error")
+
+    def begin_recording_import(
+        self,
+        *,
+        filename: object,
+        hardware: object,
+        size: int,
+    ) -> tuple[int, Path]:
+        if size <= 0:
+            raise WebActionError("录制文件为空", HTTPStatus.BAD_REQUEST)
+        if size > MAX_RECORDING_UPLOAD_BYTES:
+            raise WebActionError(
+                "录制文件超过 256 GiB 导入上限",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+        base, extension, hardware_id = _recording_import_spec(filename, hardware)
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+            recording, dataset = self._new_paths_locked(base, extension)
+            target_fd: int | None = None
+            temporary_fd: int | None = None
+            temporary_path: Path | None = None
+            try:
+                target_fd = os.open(
+                    recording,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.close(target_fd)
+                target_fd = None
+                temporary_fd, temporary_name = tempfile.mkstemp(
+                    prefix=f".{recording.stem}.importing-",
+                    suffix=extension,
+                    dir=RECORDINGS_DIR,
+                )
+                os.close(temporary_fd)
+                temporary_fd = None
+                temporary_path = Path(temporary_name).resolve()
+            except OSError as exc:
+                if target_fd is not None:
+                    os.close(target_fd)
+                if temporary_fd is not None:
+                    os.close(temporary_fd)
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                recording.unlink(missing_ok=True)
+                raise WebActionError(
+                    f"无法准备录制文件导入: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+
+            self._generation += 1
+            token = self._generation
+            self._logs.clear()
+            self._task = "import"
+            self._phase = "importing"
+            self._hardware = hardware_id
+            self._device = 0
+            self._recording = recording
+            self._dataset = dataset
+            self._mesh = dataset / "scene" / "integrated.ply"
+            self._error = None
+            self._recording_started_at = None
+            self._recording_finished_at = None
+            self._conversion_started_at = None
+            self._conversion_finished_at = None
+            self._conversion_progress = None
+            self._reconstruction_settings = None
+            self._import_temp = temporary_path
+            self._import_target = recording
+            self._import_expected_bytes = size
+            self._import_received_bytes = 0
+            self._discard_live_dir_locked()
+            self._append_log(
+                f"正在导入已有录制：{Path(str(filename)).name}（{size} 字节）。",
+                level="command",
+            )
+            self._touch_locked()
+            return token, temporary_path
+
+    def update_recording_import(self, token: int, received: int) -> None:
+        with self._lock:
+            if token != self._generation or self._task != "import":
+                raise WebActionError("录制文件导入任务已失效")
+            self._import_received_bytes = min(
+                max(0, int(received)), self._import_expected_bytes
+            )
+            self._touch_locked()
+
+    def finish_recording_import(self, token: int) -> dict[str, Any]:
+        with self._lock:
+            if token != self._generation or self._task != "import":
+                raise WebActionError("录制文件导入任务已失效")
+            temporary = self._import_temp
+            target = self._import_target
+            expected = self._import_expected_bytes
+            if temporary is None or target is None:
+                raise WebActionError(
+                    "录制文件导入状态不完整",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            try:
+                actual = temporary.stat().st_size
+            except OSError as exc:
+                raise WebActionError(
+                    f"无法检查导入文件: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+            if actual != expected or self._import_received_bytes != expected:
+                raise WebActionError(
+                    f"录制文件接收不完整：{actual}/{expected} 字节",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            try:
+                os.replace(temporary, target)
+            except OSError as exc:
+                raise WebActionError(
+                    f"无法保存导入的录制文件: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+
+            self._import_temp = None
+            self._import_target = None
+            self._import_received_bytes = expected
+            self._task = None
+            self._phase = "recorded"
+            self._recording_finished_at = _now_iso()
+            self._error = None
+            self._append_log(
+                f"已有录制导入完成：{_display_path(target)}。可以开始重建。",
+                level="success",
+            )
+            self._touch_locked()
+            return self._snapshot_locked()
+
+    def abort_recording_import(self, token: int, message: str) -> None:
+        with self._lock:
+            if token != self._generation or self._task != "import":
+                return
+            temporary = self._import_temp
+            target = self._import_target
+            self._import_temp = None
+            self._import_target = None
+            self._import_expected_bytes = 0
+            self._import_received_bytes = 0
+            self._task = None
+            self._phase = "error"
+            self._recording = None
+            self._dataset = None
+            self._mesh = None
+            cleanup_errors: list[str] = []
+            for path in (temporary, target):
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        cleanup_errors.append(f"{path.name}: {exc}")
+            if cleanup_errors:
+                message = f"{message}；临时文件清理失败：{'；'.join(cleanup_errors)}"
+            self._error = message
+            self._append_log(message, level="error")
+            self._touch_locked()
+
+    @staticmethod
+    def _recording_storage_mode(path: Path) -> str:
+        if path.is_symlink():
+            return "symlink"
+        try:
+            return "hardlink" if path.stat().st_nlink > 1 else "owned"
+        except OSError:
+            return "owned"
+
+    @staticmethod
+    def _managed_recording_path(name: object, *, require_exists: bool = True) -> Path:
+        raw_name = str(name or "").strip()
+        if not raw_name or raw_name != Path(raw_name).name:
+            raise WebActionError("本地录制名称无效", HTTPStatus.BAD_REQUEST)
+        if Path(raw_name).suffix.lower() not in {".mkv", ".bag"}:
+            raise WebActionError("仅支持管理 MKV 或 BAG 录制", HTTPStatus.BAD_REQUEST)
+        path = RECORDINGS_DIR / raw_name
+        if Path(os.path.abspath(path)).parent != RECORDINGS_DIR.resolve():
+            raise WebActionError("本地录制路径越界", HTTPStatus.BAD_REQUEST)
+        if require_exists and not os.path.lexists(path):
+            raise WebActionError("本地录制不存在或已经删除", HTTPStatus.NOT_FOUND)
+        return path.absolute()
+
+    @staticmethod
+    def _dataset_artifact_paths(recording_name: str) -> tuple[Path, list[Path]]:
+        stem = Path(recording_name).stem
+        dataset = Path(os.path.abspath(DATASETS_DIR / stem))
+        if dataset.parent != DATASETS_DIR.resolve():
+            raise WebActionError("关联数据集路径越界", HTTPStatus.BAD_REQUEST)
+        candidates = [dataset, dataset.with_name(dataset.name + ".extracting")]
+        partial_prefix = f".{stem}.partial-"
+        try:
+            candidates.extend(
+                path.absolute()
+                for path in DATASETS_DIR.iterdir()
+                if path.name.startswith(partial_prefix)
+            )
+        except FileNotFoundError:
+            pass
+        artifacts = [path for path in candidates if os.path.lexists(path)]
+        return dataset, artifacts
+
+    def _activate_recording_locked(
+        self,
+        recording: Path,
+        dataset: Path,
+        hardware: str,
+        *,
+        message: str,
+    ) -> dict[str, Any]:
+        if self._process is not None or self._task is not None:
+            raise WebActionError("已有任务正在运行，请等待它结束")
+        if not _is_nonempty_file(recording):
+            raise WebActionError("所选录制文件为空或不可读", HTTPStatus.BAD_REQUEST)
+
+        self._generation += 1
+        self._logs.clear()
+        self._phase = "recorded"
+        self._hardware = hardware
+        self._device = 0
+        self._recording = recording.absolute()
+        self._dataset = dataset.absolute()
+        self._mesh = self._dataset / "scene" / "integrated.ply"
+        self._error = None
+        self._recording_started_at = None
+        try:
+            modified = recording.stat().st_mtime
+            self._recording_finished_at = datetime.fromtimestamp(
+                modified
+            ).astimezone().isoformat(timespec="seconds")
+        except OSError:
+            self._recording_finished_at = _now_iso()
+        self._conversion_started_at = None
+        self._conversion_finished_at = None
+        self._conversion_progress = None
+        self._reconstruction_settings = None
+        self._import_temp = None
+        self._import_target = None
+        self._import_expected_bytes = 0
+        self._import_received_bytes = 0
+        self._discard_live_dir_locked()
+        if _is_nonempty_file(self._mesh):
+            self._phase = "completed"
+            try:
+                completed = self._mesh.stat().st_mtime
+                self._conversion_finished_at = datetime.fromtimestamp(
+                    completed
+                ).astimezone().isoformat(timespec="seconds")
+            except OSError:
+                self._conversion_finished_at = None
+        self._append_log(message, level="success")
+        if self._phase == "completed":
+            self._append_log(
+                "已发现关联重建结果，模型预览可以直接使用。",
+                level="success",
+            )
+        self._touch_locked()
+        return self._snapshot_locked()
+
+    def reference_local_recording(
+        self, path: object, *, hardware: object = None
+    ) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            raise WebActionError("未选择录制文件", HTTPStatus.BAD_REQUEST)
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise WebActionError(
+                f"无法访问所选录制文件: {exc}", HTTPStatus.BAD_REQUEST
+            ) from exc
+        if not source.is_file() or source.stat().st_size <= 0:
+            raise WebActionError("所选录制文件为空或不可读", HTTPStatus.BAD_REQUEST)
+        base, extension, hardware_id = _recording_import_spec(source.name, hardware)
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+            managed: Path | None = None
+            try:
+                entries = tuple(RECORDINGS_DIR.iterdir())
+            except FileNotFoundError:
+                entries = ()
+            for candidate in entries:
+                if candidate.suffix.lower() != extension:
+                    continue
+                try:
+                    if candidate.is_file() and os.path.samefile(candidate, source):
+                        managed = candidate.absolute()
+                        break
+                except OSError:
+                    continue
+
+            created = False
+            if managed is None:
+                managed, dataset = self._new_paths_locked(base, extension)
+                try:
+                    os.link(source, managed)
+                    mode = "hardlink"
+                except OSError as hardlink_error:
+                    try:
+                        managed.symlink_to(source)
+                        mode = "symlink"
+                    except OSError as symlink_error:
+                        raise WebActionError(
+                            "无法建立录制文件零拷贝引用："
+                            f"硬链接失败（{hardlink_error}）；"
+                            f"符号引用失败（{symlink_error}）",
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                        ) from symlink_error
+                created = True
+            else:
+                dataset, _ = self._dataset_artifact_paths(managed.name)
+                mode = self._recording_storage_mode(managed)
+
+            labels = {
+                "hardlink": "硬链接",
+                "symlink": "符号引用",
+                "owned": "已有项目文件",
+            }
+            try:
+                return self._activate_recording_locked(
+                    managed,
+                    dataset,
+                    hardware_id,
+                    message=(
+                        f"已通过{labels[mode]}引用本地录制，不复制视频数据："
+                        f"{_display_path(managed)}。"
+                    ),
+                )
+            except Exception:
+                if created:
+                    managed.unlink(missing_ok=True)
+                raise
+
+    def choose_local_recording(
+        self, *, hardware: object = None
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+        if not self._file_picker_lock.acquire(blocking=False):
+            raise WebActionError("本地文件选择窗口已经打开")
+        try:
+            picker = shutil.which("zenity")
+            if picker is None:
+                raise WebActionError(
+                    "系统未安装 zenity，无法打开本机文件选择窗口",
+                    HTTPStatus.NOT_IMPLEMENTED,
+                )
+            try:
+                result = subprocess.run(
+                    [
+                        picker,
+                        "--file-selection",
+                        "--title=选择 Azure Kinect MKV 或 RealSense BAG",
+                        "--file-filter=录制文件 | *.mkv *.MKV *.bag *.BAG",
+                        "--file-filter=所有文件 | *",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError as exc:
+                raise WebActionError(
+                    f"无法打开本机文件选择窗口: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+            if result.returncode in {1, 5} or not result.stdout.strip():
+                return None
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"退出代码 {result.returncode}"
+                raise WebActionError(
+                    f"本机文件选择失败: {detail}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return self.reference_local_recording(
+                result.stdout.strip(), hardware=hardware
+            )
+        finally:
+            self._file_picker_lock.release()
+
+    def select_managed_recording(
+        self, name: object, *, hardware: object = None
+    ) -> dict[str, Any]:
+        recording = self._managed_recording_path(name)
+        _, _, hardware_id = _recording_import_spec(recording.name, hardware)
+        dataset, _ = self._dataset_artifact_paths(recording.name)
+        with self._lock:
+            return self._activate_recording_locked(
+                recording,
+                dataset,
+                hardware_id,
+                message=f"已选择本地录制：{_display_path(recording)}。",
+            )
+
+    def recordings_snapshot(self) -> dict[str, Any]:
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            busy = self._process is not None or self._task is not None
+            active = self._recording.absolute() if self._recording else None
+
+        items: list[dict[str, Any]] = []
+        for recording in RECORDINGS_DIR.iterdir():
+            if recording.suffix.lower() not in {".mkv", ".bag"}:
+                continue
+            exists = _is_nonempty_file(recording)
+            try:
+                stat = recording.stat()
+                size = stat.st_size if exists else 0
+                modified_at = datetime.fromtimestamp(
+                    stat.st_mtime
+                ).astimezone().isoformat(timespec="seconds")
+            except OSError:
+                size = 0
+                modified_at = None
+            mode = self._recording_storage_mode(recording)
+            try:
+                dataset, artifact_paths = self._dataset_artifact_paths(
+                    recording.name
+                )
+            except WebActionError:
+                dataset = DATASETS_DIR / "invalid"
+                artifact_paths = []
+            output_size = sum(_path_tree_size(path) for path in artifact_paths)
+            mesh = dataset / "scene" / "integrated.ply"
+            source_path = None
+            if recording.is_symlink():
+                try:
+                    source_path = str(recording.resolve(strict=False))
+                except OSError:
+                    source_path = str(recording.readlink())
+            items.append(
+                {
+                    "name": recording.name,
+                    "path": str(recording.absolute().relative_to(ROOT.resolve())),
+                    "hardware": (
+                        "azure-kinect"
+                        if recording.suffix.lower() == ".mkv"
+                        else "d435"
+                    ),
+                    "exists": exists,
+                    "size": size,
+                    "modified_at": modified_at,
+                    "storage_mode": mode,
+                    "source_path": source_path,
+                    "additional_bytes": 0 if mode in {"hardlink", "symlink"} else size,
+                    "active": active == recording.absolute(),
+                    "can_use": exists and not busy,
+                    "can_delete": not busy,
+                    "dataset": {
+                        "path": str(dataset.absolute().relative_to(ROOT.resolve())),
+                        "exists": bool(artifact_paths),
+                        "size": output_size,
+                        "has_preprocessed": any(
+                            (path / "color").is_dir() or (path / "depth").is_dir()
+                            for path in artifact_paths
+                            if path.is_dir()
+                        ),
+                        "mesh_exists": _is_nonempty_file(mesh),
+                        "mesh_size": mesh.stat().st_size if _is_nonempty_file(mesh) else 0,
+                    },
+                }
+            )
+        items.sort(
+            key=lambda item: (item["modified_at"] or "", item["name"]),
+            reverse=True,
+        )
+        return {
+            "items": items,
+            "busy": busy,
+            "totals": {
+                "count": len(items),
+                "recording_bytes": sum(item["size"] for item in items),
+                "additional_bytes": sum(item["additional_bytes"] for item in items),
+                "output_bytes": sum(item["dataset"]["size"] for item in items),
+            },
+        }
+
+    def delete_managed_recording(
+        self, name: object, *, delete_outputs: object = False
+    ) -> dict[str, Any]:
+        if not isinstance(delete_outputs, bool):
+            raise WebActionError("删除产物选项必须是布尔值", HTTPStatus.BAD_REQUEST)
+        recording = self._managed_recording_path(name)
+        dataset, artifact_paths = self._dataset_artifact_paths(recording.name)
+        mode = self._recording_storage_mode(recording)
+        recording_size = recording.stat().st_size if _is_nonempty_file(recording) else 0
+        output_size = sum(_path_tree_size(path) for path in artifact_paths)
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("任务运行期间不能删除录制或重建产物")
+            active = (
+                self._recording is not None
+                and self._recording.absolute() == recording.absolute()
+            )
+            try:
+                if delete_outputs:
+                    for path in artifact_paths:
+                        if path.is_symlink() or path.is_file():
+                            path.unlink(missing_ok=True)
+                        elif path.is_dir():
+                            shutil.rmtree(path)
+                recording.unlink()
+            except OSError as exc:
+                raise WebActionError(
+                    f"删除本地录制失败: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+
+            if active:
+                self._recording = None
+                self._recording_started_at = None
+                self._recording_finished_at = None
+                if delete_outputs:
+                    self._dataset = None
+                    self._mesh = None
+                    self._conversion_started_at = None
+                    self._conversion_finished_at = None
+                    self._conversion_progress = None
+                elif _is_nonempty_file(self._mesh):
+                    self._phase = "completed"
+                else:
+                    self._phase = "idle"
+                if delete_outputs:
+                    self._phase = "idle"
+            self._error = None
+            detail = (
+                "并同步删除关联数据集及模型"
+                if delete_outputs
+                else "，关联产物已保留"
+            )
+            self._append_log(f"已删除本地录制 {recording.name}{detail}。", level="command")
+            self._touch_locked()
+            state = self._snapshot_locked()
+        return {
+            "state": state,
+            "recordings": self.recordings_snapshot(),
+            "removed": {
+                "name": recording.name,
+                "recording_bytes": recording_size,
+                "output_bytes": output_size if delete_outputs else 0,
+                "outputs_deleted": delete_outputs,
+                "external_source_preserved": mode in {"hardlink", "symlink"},
+            },
+        }
 
     def _finish_conversion_locked(self, returncode: int) -> None:
         self._conversion_finished_at = _now_iso()
@@ -427,7 +1387,7 @@ class ControlCenter:
                     processed=self._conversion_progress.get("frame_count"),
                     total=self._conversion_progress.get("frame_count"),
                 )
-            self._append_log("转换与四阶段重建完成。", level="success")
+            self._append_log("RGB-D 提取与四阶段重建完成。", level="success")
             return
         self._phase = "error"
         if self._conversion_progress is not None:
@@ -435,7 +1395,7 @@ class ControlCenter:
         if returncode == 0:
             self._error = "重建进程已结束，但未找到最终 integrated.ply"
         else:
-            self._error = f"转换/重建失败（退出代码 {returncode}），录制文件仍已保留"
+            self._error = f"重建失败（退出代码 {returncode}），录制文件仍已保留"
         self._append_log(self._error, level="error")
 
     def start_recording(
@@ -453,7 +1413,7 @@ class ControlCenter:
 
         spec = HARDWARE[hardware_id]
         with self._lock:
-            if self._process is not None:
+            if self._process is not None or self._task is not None:
                 raise WebActionError("当前任务尚未结束，不能开始新的录制")
             recording, dataset = self._new_paths_locked(name, spec["extension"])
             self._logs.clear()
@@ -469,6 +1429,7 @@ class ControlCenter:
             self._conversion_started_at = None
             self._conversion_finished_at = None
             self._conversion_progress = None
+            self._reconstruction_settings = None
             live_dir = self._prepare_live_dir_locked()
             self._touch_locked()
             command = [
@@ -544,19 +1505,25 @@ class ControlCenter:
         self._append_log("正常停止等待超时，正在终止卡住的采集进程。", level="error")
         self._signal_process_group(process, signal.SIGTERM)
 
-    def start_conversion(self, *, stride: object = 1) -> dict[str, Any]:
+    def start_conversion(
+        self,
+        *,
+        stride: object = 1,
+        parameters: object = None,
+    ) -> dict[str, Any]:
         try:
             stride_value = int(stride)
         except (TypeError, ValueError) as exc:
             raise WebActionError("帧步长必须是整数", HTTPStatus.BAD_REQUEST) from exc
         if not 1 <= stride_value <= 1000:
             raise WebActionError("帧步长必须在 1 到 1000 之间", HTTPStatus.BAD_REQUEST)
+        parameter_values = _validated_reconstruction_parameters(parameters)
 
         with self._lock:
-            if self._process is not None:
-                raise WebActionError("当前任务尚未结束，不能开始转换")
+            if self._process is not None or self._task is not None:
+                raise WebActionError("当前任务尚未结束，不能开始重建")
             if not _is_nonempty_file(self._recording):
-                raise WebActionError("没有可转换的录制文件；请先完成录制")
+                raise WebActionError("没有可重建的录制文件；请先完成录制")
             assert self._recording is not None
             assert self._dataset is not None
             command = [
@@ -568,6 +1535,9 @@ class ControlCenter:
                 "--stride",
                 str(stride_value),
             ]
+            for key, value in parameter_values.items():
+                encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+                command.extend(("--set", f"{key}={encoded}"))
             if self._dataset.exists():
                 command.append("--force-extract")
             self._phase = "converting"
@@ -575,14 +1545,29 @@ class ControlCenter:
             self._conversion_started_at = _now_iso()
             self._conversion_finished_at = None
             self._mesh = self._dataset / "scene" / "integrated.ply"
+            self._reconstruction_settings = {
+                "stride": stride_value,
+                **parameter_values,
+            }
             self._reset_conversion_progress_locked()
             self._append_log(
                 "开始提取 RGB-D 帧并执行 make、register、refine、integrate 四阶段重建。",
                 level="command",
             )
+            if parameter_values:
+                readable = "，".join(
+                    f"{key}={value}" for key, value in self._reconstruction_settings.items()
+                )
+                self._append_log(f"本次重建参数：{readable}", level="command")
             self._touch_locked()
             try:
-                self._spawn_locked("convert", command)
+                self._spawn_locked(
+                    "convert",
+                    command,
+                    environment_overrides={
+                        "OPEN3D_RECONSTRUCT_WEB_METRICS": "1",
+                    },
+                )
             except Exception as exc:
                 self._phase = "error"
                 self._error = str(exc)
@@ -618,6 +1603,18 @@ class ControlCenter:
         latest = max(candidates, key=lambda path: path.name)
         return latest if _is_nonempty_file(latest) else None
 
+    @staticmethod
+    def _ordered_files(directory: Path, patterns: tuple[str, ...]) -> list[Path]:
+        if not directory.is_dir():
+            return []
+        candidates: set[Path] = set()
+        for pattern in patterns:
+            candidates.update(directory.glob(pattern))
+        return sorted(
+            (path for path in candidates if _is_nonempty_file(path)),
+            key=lambda path: path.name,
+        )
+
     def _live_snapshot_locked(self) -> dict[str, Any] | None:
         directory = self._live_dir
         if directory is None:
@@ -648,14 +1645,31 @@ class ControlCenter:
         value["depth_file"] = depth
         return value
 
-    def _process_paths_locked(self) -> dict[str, Path | None]:
+    def _process_paths_locked(self, frame_index: int | None = None) -> dict[str, Any]:
         dataset = self._dataset
         if dataset is None:
-            return {"rgb": None, "depth": None, "model": None}
+            return {
+                "rgb": None,
+                "depth": None,
+                "model": None,
+                "frame_index": None,
+                "frame_count": 0,
+                "working": None,
+            }
         extracting = dataset.with_name(dataset.name + ".extracting")
         working = dataset if dataset.is_dir() else extracting
-        rgb = self._latest_file(working / "color", ("*.jpg", "*.png"))
-        depth = self._latest_file(working / "depth", ("*.png",))
+        rgb_files = self._ordered_files(working / "color", ("*.jpg", "*.png"))
+        depth_files = self._ordered_files(working / "depth", ("*.png",))
+        frame_count = min(len(rgb_files), len(depth_files))
+        selected_index: int | None = None
+        rgb: Path | None = None
+        depth: Path | None = None
+        if frame_count:
+            selected_index = frame_count - 1 if frame_index is None else max(
+                0, min(int(frame_index), frame_count - 1)
+            )
+            rgb = rgb_files[selected_index]
+            depth = depth_files[selected_index]
         model: Path | None = None
         if _is_nonempty_file(self._mesh):
             model = self._mesh
@@ -664,28 +1678,107 @@ class ControlCenter:
                 working / "fragments",
                 ("fragment_optimized_*.ply", "fragment_*.ply"),
             )
-        return {"rgb": rgb, "depth": depth, "model": model}
+        return {
+            "rgb": rgb,
+            "depth": depth,
+            "model": model,
+            "frame_index": selected_index,
+            "frame_count": frame_count,
+            "working": working,
+        }
 
     def _process_snapshot_locked(self) -> dict[str, Any] | None:
         if self._conversion_progress is None:
             return None
         progress = dict(self._conversion_progress)
-        paths = self._process_paths_locked()
         stage = progress.get("stage")
+        now = time.monotonic()
+        started = float(progress.pop("_started_monotonic", now))
+        stage_started = float(progress.pop("_stage_started_monotonic", started))
+        last_output = float(progress.pop("_last_output_monotonic", started))
+        elapsed = max(0.0, now - started)
+        stage_elapsed = max(0.0, now - stage_started)
+        quiet = max(0.0, now - last_output)
+        progress.update(
+            elapsed_seconds=elapsed,
+            stage_elapsed_seconds=stage_elapsed,
+            quiet_seconds=quiet,
+            process_alive=self._process is not None and self._process.poll() is None,
+            heartbeat_at=_now_iso(),
+        )
+
+        events = [dict(event) for event in progress.pop("_matching_events", [])]
+        active = [
+            dict(event)
+            for event in progress.pop("_matching_active", {}).values()
+        ]
+        progress.pop("_matching_seen", None)
+        attempted = int(progress.pop("_matching_attempted", 0) or 0)
+        succeeded = int(progress.pop("_matching_succeeded", 0) or 0)
+        failed = int(progress.pop("_matching_failed", 0) or 0)
+        information_max = float(
+            progress.pop("_matching_information_max", 0.0) or 0.0
+        )
+        last_match = progress.pop("_matching_last", None)
+        expected_matches = progress.pop("_matching_expected", None)
+        settings = progress.get("settings") or {}
+        progress["matching"] = {
+            "frame_count": int(progress.get("frame_count") or 0),
+            "frames_per_fragment": int(
+                settings.get("n_frames_per_fragment", 100)
+            ),
+            "expected": expected_matches,
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+            "information_max": information_max,
+            "active": active,
+            "events": events,
+            "last": dict(last_match) if isinstance(last_match, dict) else None,
+        }
+
+        paths = self._process_paths_locked()
+
+        if stage == "make" and isinstance(paths.get("working"), Path):
+            fragment_files = [
+                path
+                for path in self._ordered_files(
+                    paths["working"] / "fragments", ("fragment_*.ply",)
+                )
+                if re.fullmatch(r"fragment_\d+\.ply", path.name)
+            ]
+            completed_fragments = max(
+                len(fragment_files), int(progress.get("fragment_completed") or 0)
+            )
+            fragment_total = progress.get("fragment_total")
+            if isinstance(fragment_total, int) and fragment_total > 0:
+                progress["fragment_completed"] = min(completed_fragments, fragment_total)
+                progress["processed"] = min(completed_fragments, fragment_total)
+                progress["total"] = fragment_total
+
         rgb = self._versioned_file(paths["rgb"])
         depth = self._versioned_file(paths["depth"])
         model = self._versioned_file(paths["model"])
-        if stage == "extract" and rgb and depth:
-            progress["artifact"] = {
+        rgbd_artifact: dict[str, Any] | None = None
+        model_artifact: dict[str, Any] | None = None
+        if rgb and depth:
+            frame_index = int(paths["frame_index"] or 0)
+            frame_count = int(paths["frame_count"] or 0)
+            rgbd_artifact = {
                 "kind": "rgbd",
                 "rgb": rgb,
                 "depth": depth,
-                "rgb_url": "/api/process/rgb",
-                "depth_url": "/api/process/depth",
-                "version": f"{rgb['version']}-{depth['version']}",
+                "rgb_url": f"/api/process/rgb?frame={frame_index}",
+                "depth_url": f"/api/process/depth?frame={frame_index}",
+                "version": f"{frame_index}-{rgb['version']}-{depth['version']}",
+                "frame_index": frame_index,
+                "frame_count": frame_count,
+                "label": (
+                    "输入序列预览" if stage == "make" else "最新提取帧"
+                ),
             }
-        elif model:
-            progress["artifact"] = {
+        if model:
+            model_artifact = {
                 "kind": "model",
                 "model": model,
                 "model_url": "/api/process/model",
@@ -694,25 +1787,33 @@ class ControlCenter:
                     "最终融合网格" if paths["model"] == self._mesh else "最新局部片段"
                 ),
             }
-        elif rgb and depth:
-            progress["artifact"] = {
-                "kind": "rgbd",
-                "rgb": rgb,
-                "depth": depth,
-                "rgb_url": "/api/process/rgb",
-                "depth_url": "/api/process/depth",
-                "version": f"{rgb['version']}-{depth['version']}",
-            }
-        else:
-            progress["artifact"] = None
+        progress["artifacts"] = {"rgbd": rgbd_artifact, "model": model_artifact}
+        progress["artifact"] = (
+            rgbd_artifact if stage == "extract" else (model_artifact or rgbd_artifact)
+        )
         return progress
 
     def _snapshot_locked(self) -> dict[str, Any]:
         process = self._process
+        busy = process is not None or self._task is not None
         recording = _file_summary(self._recording)
         mesh = _file_summary(self._mesh)
         recording_ready = bool(recording and recording["exists"] and recording["size"] > 0)
         mesh_ready = bool(mesh and mesh["exists"] and mesh["size"] > 0)
+        import_progress: dict[str, Any] | None = None
+        if self._task == "import":
+            total_bytes = max(0, self._import_expected_bytes)
+            received_bytes = min(
+                max(0, self._import_received_bytes), total_bytes
+            )
+            import_progress = {
+                "name": self._import_target.name if self._import_target else None,
+                "received_bytes": received_bytes,
+                "total_bytes": total_bytes,
+                "percent": (
+                    received_bytes / total_bytes * 100.0 if total_bytes else 0.0
+                ),
+            }
         return {
             "phase": self._phase,
             "revision": self._revision,
@@ -729,11 +1830,15 @@ class ControlCenter:
             "recording_finished_at": self._recording_finished_at,
             "conversion_started_at": self._conversion_started_at,
             "conversion_finished_at": self._conversion_finished_at,
-            "can_start_recording": process is None,
+            "reconstruction_settings": self._reconstruction_settings,
+            "recording_import": import_progress,
+            "can_start_recording": not busy,
+            "can_import_recording": not busy,
             "can_stop_recording": process is not None and self._task == "record" and self._phase == "recording",
-            "can_start_conversion": process is None and recording_ready,
+            "can_start_conversion": not busy and recording_ready,
             "recording_url": "/api/files/recording" if recording_ready else None,
             "mesh_url": "/api/files/mesh" if mesh_ready else None,
+            "mesh_preview_url": "/api/files/mesh-preview" if mesh_ready else None,
             "live": self._live_snapshot_locked(),
             "conversion": self._process_snapshot_locked(),
             "logs": list(self._logs),
@@ -764,11 +1869,11 @@ class ControlCenter:
                 return None
             return path.resolve()
 
-    def process_file(self, kind: str) -> Path | None:
+    def process_file(self, kind: str, *, frame_index: int | None = None) -> Path | None:
         if kind not in {"rgb", "depth", "model"}:
             return None
         with self._lock:
-            path = self._process_paths_locked().get(kind)
+            path = self._process_paths_locked(frame_index).get(kind)
             dataset = self._dataset
             if path is None or dataset is None or not _is_nonempty_file(path):
                 return None
@@ -789,15 +1894,124 @@ class ControlCenter:
                 return None
             assert path is not None
             try:
-                path.resolve().relative_to(ROOT.resolve())
+                if kind == "mesh":
+                    path.resolve().relative_to(ROOT.resolve())
+                else:
+                    path.absolute().relative_to(RECORDINGS_DIR.resolve())
             except ValueError:
                 return None
-            return path.resolve()
+            return path.resolve() if kind == "mesh" else path.absolute()
+
+    def mesh_preview_file(self) -> Path | None:
+        """Return a cached browser-sized triangle mesh without changing the result."""
+        source = self.result_file("mesh")
+        if source is None:
+            return None
+        preview = source.with_name(f"{source.stem}.preview.ply")
+
+        def cache_is_current() -> bool:
+            try:
+                return (
+                    preview.is_file()
+                    and preview.stat().st_size > 0
+                    and preview.stat().st_mtime_ns >= source.stat().st_mtime_ns
+                )
+            except OSError:
+                return False
+
+        if cache_is_current():
+            return preview.resolve()
+
+        with self._mesh_preview_lock:
+            if cache_is_current():
+                return preview.resolve()
+            self._append_log(
+                "正在生成浏览器网格预览；完整 PLY 不会被修改。",
+                level="command",
+            )
+            started = time.monotonic()
+            temporary: Path | None = None
+            try:
+                import open3d as o3d
+
+                mesh = o3d.io.read_triangle_mesh(
+                    str(source),
+                    enable_post_processing=False,
+                    print_progress=False,
+                )
+                source_triangles = len(mesh.triangles)
+                if source_triangles <= 0:
+                    raise WebActionError(
+                        "重建结果只有点数据，没有可供网格预览的三角面",
+                        HTTPStatus.UNPROCESSABLE_ENTITY,
+                    )
+
+                preview_mesh = mesh
+                if source_triangles > MESH_PREVIEW_TARGET_TRIANGLES:
+                    extent = max(mesh.get_axis_aligned_bounding_box().get_extent())
+                    if math.isfinite(extent) and extent > 0:
+                        preview_mesh = mesh.simplify_vertex_clustering(
+                            voxel_size=extent / MESH_PREVIEW_CLUSTER_RESOLUTION,
+                            contraction=o3d.geometry.SimplificationContraction.Average,
+                        )
+                    if len(preview_mesh.triangles) > MESH_PREVIEW_TARGET_TRIANGLES:
+                        preview_mesh = preview_mesh.simplify_quadric_decimation(
+                            target_number_of_triangles=MESH_PREVIEW_TARGET_TRIANGLES,
+                        )
+                preview_mesh.remove_degenerate_triangles()
+                preview_mesh.remove_duplicated_triangles()
+                preview_mesh.remove_unreferenced_vertices()
+                preview_mesh.compute_vertex_normals()
+
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{source.stem}-preview-",
+                    suffix=".ply",
+                    dir=source.parent,
+                )
+                os.close(descriptor)
+                temporary = Path(temporary_name)
+                written = o3d.io.write_triangle_mesh(
+                    str(temporary),
+                    preview_mesh,
+                    write_ascii=False,
+                    compressed=False,
+                    write_vertex_normals=True,
+                    write_vertex_colors=True,
+                    write_triangle_uvs=False,
+                    print_progress=False,
+                )
+                if not written or not _is_nonempty_file(temporary):
+                    raise WebActionError(
+                        "网格预览文件写入失败",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                os.replace(temporary, preview)
+                temporary = None
+                elapsed = time.monotonic() - started
+                self._append_log(
+                    "浏览器网格预览已就绪："
+                    f"{source_triangles:,} 面 → {len(preview_mesh.triangles):,} 面，"
+                    f"用时 {elapsed:.1f}s。",
+                    level="success",
+                )
+                return preview.resolve()
+            except WebActionError:
+                raise
+            except Exception as exc:
+                message = f"生成浏览器网格预览失败: {exc}"
+                self._append_log(message, level="error")
+                raise WebActionError(
+                    message,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def discover_devices(self, *, refresh: bool = False) -> dict[str, Any]:
         with self._device_lock:
             with self._lock:
-                active = self._process is not None
+                active = self._process is not None or self._task is not None
                 if self._device_cache is not None and (
                     active or (not refresh and time.monotonic() - self._device_cache_at < 10.0)
                 ):
@@ -861,6 +2075,12 @@ class ControlCenter:
     def close(self) -> None:
         with self._lock:
             process = self._process
+            import_token = self._generation if self._task == "import" else None
+        if import_token is not None:
+            self.abort_recording_import(
+                import_token,
+                "Web 服务退出，已有录制文件导入已中止。",
+            )
         try:
             if process is None or process.poll() is not None:
                 return
@@ -894,6 +2114,13 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
 
         def log_message(self, _format: str, *args: object) -> None:
             return
+
+        def handle(self) -> None:
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError):
+                # Browsers legitimately cancel superseded image requests.
+                return
 
         def _host_is_local(self) -> bool:
             host = self.headers.get("Host", "").lower()
@@ -964,6 +2191,78 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 raise WebActionError("JSON 请求必须是对象", HTTPStatus.BAD_REQUEST)
             return value
 
+        def _receive_recording_import(self, parsed) -> dict[str, Any]:
+            if self.headers.get("X-Open3D-Reconstruct") != "web":
+                raise WebActionError("请求来源校验失败", HTTPStatus.FORBIDDEN)
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/octet-stream":
+                raise WebActionError(
+                    "录制文件必须使用 application/octet-stream 上传",
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                )
+            if self.headers.get("Transfer-Encoding"):
+                raise WebActionError(
+                    "录制文件导入不支持分块传输",
+                    HTTPStatus.BAD_REQUEST,
+                )
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError as exc:
+                raise WebActionError(
+                    "录制文件 Content-Length 无效",
+                    HTTPStatus.BAD_REQUEST,
+                ) from exc
+            if length <= 0:
+                raise WebActionError("录制文件为空", HTTPStatus.BAD_REQUEST)
+            if length > MAX_RECORDING_UPLOAD_BYTES:
+                raise WebActionError(
+                    "录制文件超过 256 GiB 导入上限",
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+            free_bytes = shutil.disk_usage(RECORDINGS_DIR).free
+            if length + MIN_FREE_STORAGE_BYTES > free_bytes:
+                raise WebActionError(
+                    "项目磁盘剩余空间不足，无法导入该录制文件",
+                    HTTPStatus.INSUFFICIENT_STORAGE,
+                )
+
+            query = parse_qs(parsed.query)
+            filename = query.get("filename", [None])[0]
+            hardware = query.get("hardware", [None])[0]
+            token, temporary = controller.begin_recording_import(
+                filename=filename,
+                hardware=hardware,
+                size=length,
+            )
+            received = 0
+            try:
+                with temporary.open("wb") as destination:
+                    while received < length:
+                        chunk = self.rfile.read(
+                            min(RECORDING_UPLOAD_CHUNK_BYTES, length - received)
+                        )
+                        if not chunk:
+                            raise WebActionError(
+                                f"录制文件传输中断：{received}/{length} 字节",
+                                HTTPStatus.BAD_REQUEST,
+                            )
+                        destination.write(chunk)
+                        received += len(chunk)
+                        controller.update_recording_import(token, received)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                return controller.finish_recording_import(token)
+            except WebActionError as exc:
+                controller.abort_recording_import(token, str(exc))
+                raise
+            except (OSError, ConnectionError) as exc:
+                message = f"录制文件导入失败: {exc}"
+                controller.abort_recording_import(token, message)
+                raise WebActionError(
+                    message,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+
         def _send_static(self, filename: str, content_type: str) -> None:
             path = WEBUI_DIR / filename
             try:
@@ -978,15 +2277,27 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
             )
 
         def _send_file(self, kind: str) -> None:
-            path = controller.result_file(kind)
+            try:
+                path = (
+                    controller.mesh_preview_file()
+                    if kind == "mesh-preview"
+                    else controller.result_file(kind)
+                )
+            except WebActionError as exc:
+                self._error(exc.status, str(exc))
+                return
             if path is None:
                 self._error(HTTPStatus.NOT_FOUND, "文件尚未生成或已不存在")
                 return
-            content_type = "model/ply" if kind == "mesh" else "application/octet-stream"
+            content_type = (
+                "model/ply"
+                if kind in {"mesh", "mesh-preview"}
+                else "application/octet-stream"
+            )
             size = path.stat().st_size
             self.send_response(HTTPStatus.OK)
             self._headers(content_type, size, cache="no-store")
-            disposition = "inline" if kind == "mesh" else "attachment"
+            disposition = "inline" if kind in {"mesh", "mesh-preview"} else "attachment"
             self.send_header(
                 "Content-Disposition",
                 f"{disposition}; filename*=UTF-8''{quote(path.name)}",
@@ -1000,22 +2311,33 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 pass
 
         def _stream_visual_file(self, path: Path, content_type: str) -> None:
-            size = path.stat().st_size
-            self.send_response(HTTPStatus.OK)
-            self._headers(content_type, size, cache="no-store")
-            self.end_headers()
             try:
-                with path.open("rb") as source:
+                source = path.open("rb")
+            except OSError:
+                self._error(HTTPStatus.NOT_FOUND, "可视化内容已更新，请重试")
+                return
+            with source:
+                size = os.fstat(source.fileno()).st_size
+                self.send_response(HTTPStatus.OK)
+                self._headers(content_type, size, cache="no-store")
+                self.end_headers()
+                try:
                     while chunk := source.read(1024 * 1024):
                         self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
-        def _send_visual(self, scope: str, kind: str) -> None:
+        def _send_visual(
+            self,
+            scope: str,
+            kind: str,
+            *,
+            frame_index: int | None = None,
+        ) -> None:
             path = (
                 controller.live_file(kind)
                 if scope == "live"
-                else controller.process_file(kind)
+                else controller.process_file(kind, frame_index=frame_index)
             )
             if path is None:
                 self._error(HTTPStatus.NOT_FOUND, "可视化内容尚未生成")
@@ -1089,6 +2411,10 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                         ),
                     }
                 )
+            elif parsed.path == "/api/recordings":
+                self._send_json(
+                    {"ok": True, "recordings": controller.recordings_snapshot()}
+                )
             elif parsed.path == "/api/live/state":
                 self._send_json({"ok": True, "live": controller.live_snapshot()})
             elif parsed.path in {"/api/live/rgb", "/api/live/depth"}:
@@ -1098,11 +2424,25 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 "/api/process/depth",
                 "/api/process/model",
             }:
-                self._send_visual("process", parsed.path.rsplit("/", 1)[-1])
+                frame_index: int | None = None
+                raw_frame = parse_qs(parsed.query).get("frame", [None])[0]
+                if raw_frame is not None:
+                    try:
+                        frame_index = int(raw_frame)
+                    except (TypeError, ValueError):
+                        self._error(HTTPStatus.BAD_REQUEST, "预览帧编号无效")
+                        return
+                self._send_visual(
+                    "process",
+                    parsed.path.rsplit("/", 1)[-1],
+                    frame_index=frame_index,
+                )
             elif parsed.path == "/api/files/recording":
                 self._send_file("recording")
             elif parsed.path == "/api/files/mesh":
                 self._send_file("mesh")
+            elif parsed.path == "/api/files/mesh-preview":
+                self._send_file("mesh-preview")
             else:
                 self._error(HTTPStatus.NOT_FOUND, "页面不存在")
 
@@ -1112,8 +2452,35 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 return
             parsed = urlsplit(self.path)
             try:
+                if parsed.path == "/api/recording/import":
+                    state = self._receive_recording_import(parsed)
+                    self._send_json({"ok": True, "state": state})
+                    return
                 body = self._read_json()
-                if parsed.path == "/api/record/start":
+                if parsed.path == "/api/recording/select-local":
+                    selected = controller.choose_local_recording(
+                        hardware=body.get("hardware")
+                    )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "cancelled": selected is None,
+                            "state": selected or controller.snapshot(),
+                        }
+                    )
+                    return
+                if parsed.path == "/api/recordings/use":
+                    state = controller.select_managed_recording(
+                        body.get("name"), hardware=body.get("hardware")
+                    )
+                elif parsed.path == "/api/recordings/delete":
+                    result = controller.delete_managed_recording(
+                        body.get("name"),
+                        delete_outputs=body.get("delete_outputs", False),
+                    )
+                    self._send_json({"ok": True, **result})
+                    return
+                elif parsed.path == "/api/record/start":
                     state = controller.start_recording(
                         hardware=body.get("hardware"),
                         device=body.get("device", 0),
@@ -1122,7 +2489,10 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 elif parsed.path == "/api/record/stop":
                     state = controller.stop_recording()
                 elif parsed.path == "/api/convert/start":
-                    state = controller.start_conversion(stride=body.get("stride", 1))
+                    state = controller.start_conversion(
+                        stride=body.get("stride", 1),
+                        parameters=body.get("parameters"),
+                    )
                 else:
                     self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                     return

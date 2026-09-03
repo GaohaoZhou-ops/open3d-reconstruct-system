@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,8 @@ class K4ALibraries:
         self.core.k4a_device_get_imu_sample.restype = ctypes.c_int
         self.core.k4a_capture_release.argtypes = [ctypes.c_void_p]
         self.core.k4a_capture_release.restype = None
+        self.core.k4a_capture_reference.argtypes = [ctypes.c_void_p]
+        self.core.k4a_capture_reference.restype = None
         self.core.k4a_capture_get_color_image.argtypes = [ctypes.c_void_p]
         self.core.k4a_capture_get_color_image.restype = ctypes.c_void_p
         self.core.k4a_capture_get_depth_image.argtypes = [ctypes.c_void_p]
@@ -221,9 +224,6 @@ def _preview_capture(
     publisher: LivePreviewPublisher,
     frame_count: int,
 ) -> None:
-    if time.monotonic() - publisher.last_publish < publisher.minimum_interval:
-        return
-    import cv2
     import numpy as np
 
     color_handle = api.core.k4a_capture_get_color_image(capture)
@@ -236,21 +236,21 @@ def _preview_capture(
         return
     try:
         color_format = api.core.k4a_image_get_format(color_handle)
+        color_width = api.core.k4a_image_get_width_pixels(color_handle)
+        color_height = api.core.k4a_image_get_height_pixels(color_handle)
         color_size = api.core.k4a_image_get_size(color_handle)
         color_buffer = ctypes.string_at(
             api.core.k4a_image_get_buffer(color_handle), color_size
         )
-        if color_format == K4A_IMAGE_FORMAT_COLOR_MJPG:
-            color = cv2.imdecode(np.frombuffer(color_buffer, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if color is None:
-                raise RuntimeError("无法解码 Azure Kinect MJPEG 彩色帧")
-        elif color_format == K4A_IMAGE_FORMAT_COLOR_BGRA32:
-            width = api.core.k4a_image_get_width_pixels(color_handle)
-            height = api.core.k4a_image_get_height_pixels(color_handle)
+        if color_format == K4A_IMAGE_FORMAT_COLOR_BGRA32:
             stride = api.core.k4a_image_get_stride_bytes(color_handle)
-            rows = np.frombuffer(color_buffer, dtype=np.uint8).reshape(height, stride)
-            color = rows[:, : width * 4].reshape(height, width, 4).copy()
-        else:
+            rows = np.frombuffer(color_buffer, dtype=np.uint8).reshape(
+                color_height, stride
+            )
+            color = rows[:, : color_width * 4].reshape(
+                color_height, color_width, 4
+            ).copy()
+        elif color_format != K4A_IMAGE_FORMAT_COLOR_MJPG:
             raise RuntimeError(
                 "Web 实时预览目前支持 Azure Kinect MJPG/BGRA32 彩色格式"
             )
@@ -266,16 +266,104 @@ def _preview_capture(
             depth_height, depth_stride // 2
         )
         depth = depth_rows[:, :depth_width].copy()
-        publisher.publish_arrays(
-            color,
-            depth,
-            frame_count=frame_count,
-            color_is_bgr=True,
-            force=True,
-        )
+        if color_format == K4A_IMAGE_FORMAT_COLOR_MJPG:
+            publisher.publish_jpeg_depth(
+                color_buffer,
+                depth,
+                frame_count=frame_count,
+                color_width=color_width,
+                color_height=color_height,
+                force=True,
+            )
+        else:
+            publisher.publish_arrays(
+                color,
+                depth,
+                frame_count=frame_count,
+                color_is_bgr=True,
+                force=True,
+            )
     finally:
         api.core.k4a_image_release(color_handle)
         api.core.k4a_image_release(depth_handle)
+
+
+class K4APreviewWorker:
+    """Processes only the newest due preview without blocking camera recording."""
+
+    def __init__(
+        self,
+        api: K4ALibraries,
+        publisher: LivePreviewPublisher,
+    ) -> None:
+        self.api = api
+        self.publisher = publisher
+        self._condition = threading.Condition()
+        self._pending: tuple[ctypes.c_void_p, int] | None = None
+        self._closed = False
+        self._next_due = 0.0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="azure-kinect-web-preview",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, capture: ctypes.c_void_p, frame_count: int) -> None:
+        now = time.monotonic()
+        with self._condition:
+            if self._closed or now + 0.005 < self._next_due:
+                return
+            if self._next_due == 0.0:
+                self._next_due = now + self.publisher.minimum_interval
+            else:
+                self._next_due += self.publisher.minimum_interval
+                if self._next_due <= now:
+                    self._next_due = now + self.publisher.minimum_interval
+
+        self.api.core.k4a_capture_reference(capture)
+        retained = ctypes.c_void_p(capture.value)
+        dropped: tuple[ctypes.c_void_p, int] | None = None
+        with self._condition:
+            if self._closed:
+                self.api.core.k4a_capture_release(retained)
+                return
+            dropped = self._pending
+            self._pending = (retained, frame_count)
+            self._condition.notify()
+        if dropped is not None:
+            self.api.core.k4a_capture_release(dropped[0])
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._pending is None and self._closed:
+                    return
+                assert self._pending is not None
+                capture, frame_count = self._pending
+                self._pending = None
+            try:
+                _preview_capture(self.api, capture, self.publisher, frame_count)
+            except Exception as exc:
+                self.publisher.report_error(
+                    f"异步实时预览更新失败: {exc}",
+                    frame_count=frame_count,
+                )
+            finally:
+                self.api.core.k4a_capture_release(capture)
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            self.publisher.report_error(
+                "异步实时预览线程未能及时结束",
+                frame_count=0,
+            )
 
 
 def record_with_imu(
@@ -293,6 +381,7 @@ def record_with_imu(
     cameras_started = False
     imu_started = False
     recording_created = False
+    preview_worker: K4APreviewWorker | None = None
     frame_count = 0
     imu_count = 0
     started = time.monotonic()
@@ -336,6 +425,7 @@ def record_with_imu(
         started = time.monotonic()
         last_frame = started
         publisher.begin_capture()
+        preview_worker = K4APreviewWorker(api, publisher)
         duration_text = f"{seconds:g} 秒" if seconds is not None else "直到 Ctrl+C"
         print(f"开始 Web RGB-D + IMU 录制 {duration_text}。按 Ctrl+C 可保存退出。")
         while True:
@@ -387,17 +477,14 @@ def record_with_imu(
                             sample_rate_hz=imu_count / elapsed,
                             sample_count=imu_count,
                         )
-                try:
-                    _preview_capture(api, capture, publisher, frame_count)
-                except Exception as exc:
-                    publisher.report_error(
-                        f"实时预览更新失败: {exc}", frame_count=frame_count
-                    )
+                preview_worker.submit(capture, frame_count)
             finally:
                 api.core.k4a_capture_release(capture)
     except KeyboardInterrupt:
         print("\n收到中断，正在封装并保存 MKV……")
     finally:
+        if preview_worker is not None:
+            preview_worker.close()
         if imu_started:
             api.core.k4a_device_stop_imu(device_handle)
         if cameras_started:

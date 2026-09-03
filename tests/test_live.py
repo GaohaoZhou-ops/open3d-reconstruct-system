@@ -5,12 +5,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from open3d_reconstruct.k4a_live import (
     K4ADeviceConfiguration,
     K4AImuSample,
+    K4APreviewWorker,
     native_configuration,
 )
 from open3d_reconstruct.live import LivePreviewPublisher
@@ -52,6 +54,71 @@ class LivePreviewTests(unittest.TestCase):
             publisher.close(frame_count=7)
             closed = json.loads((directory / "state.json").read_text())
             self.assertFalse(closed["active"])
+
+    def test_existing_camera_jpeg_is_published_without_reencoding(self) -> None:
+        import cv2
+
+        with tempfile.TemporaryDirectory() as temporary:
+            publisher = LivePreviewPublisher(
+                Path(temporary), hardware="azure-kinect", max_fps=15
+            )
+            color = np.full((12, 16, 3), 120, dtype=np.uint8)
+            encoded_ok, encoded = cv2.imencode(".jpg", color)
+            self.assertTrue(encoded_ok)
+            jpeg = encoded.tobytes()
+            depth = np.full((8, 10), 900, dtype=np.uint16)
+
+            self.assertTrue(
+                publisher.publish_jpeg_depth(
+                    jpeg,
+                    depth,
+                    frame_count=3,
+                    color_width=16,
+                    color_height=12,
+                    force=True,
+                )
+            )
+            self.assertEqual((publisher.directory / "rgb.jpg").read_bytes(), jpeg)
+            state = json.loads((publisher.directory / "state.json").read_text())
+            self.assertTrue(state["rgb"]["passthrough"])
+            self.assertEqual(state["preview_target_fps"], 15)
+            self.assertGreaterEqual(state["preview_processing_ms"], 0)
+
+    def test_k4a_preview_worker_throttles_and_balances_references(self) -> None:
+        class FakeCore:
+            def __init__(self) -> None:
+                self.references = 0
+                self.releases = 0
+
+            def k4a_capture_reference(self, _capture) -> None:
+                self.references += 1
+
+            def k4a_capture_release(self, _capture) -> None:
+                self.releases += 1
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.core = FakeCore()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            publisher = LivePreviewPublisher(
+                Path(temporary), hardware="azure-kinect", max_fps=20
+            )
+            api = FakeApi()
+            with mock.patch(
+                "open3d_reconstruct.k4a_live._preview_capture"
+            ) as preview, mock.patch(
+                "open3d_reconstruct.k4a_live.time.monotonic",
+                side_effect=(0.0, 0.034, 0.069, 0.104, 0.138, 0.173),
+            ):
+                worker = K4APreviewWorker(api, publisher)
+                for frame_count in range(1, 7):
+                    worker.submit(ctypes.c_void_p(frame_count), frame_count)
+                worker.close()
+
+            self.assertGreaterEqual(preview.call_count, 1)
+            self.assertEqual(api.core.references, 4)
+            self.assertEqual(api.core.releases, 4)
 
     def test_realsense_imu_capability_is_reported_honestly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
