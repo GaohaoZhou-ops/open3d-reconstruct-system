@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Open3D Reconstruct · 本地控制台</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Open3D Reconstruct 首页">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>
+        <strong>Open3D Reconstruct</strong>
+        <small>RGB-D capture &amp; reconstruction</small>
+      </span>
+    </a>
+    <div class="local-pill"><span></span>仅本机 · 11920</div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">LOCAL SCAN WORKSPACE</p>
+        <h1>从相机录制到<br><em>三维场景</em>，一步到位。</h1>
+        <p class="hero-copy">选择硬件，实时观察 RGB、深度与传感器状态，再把 RGB-D 数据转换为 Open3D 三角网格。采集、过程预览和结果都留在本机。</p>
+      </div>
+      <ol class="journey" aria-label="工作流程">
+        <li class="active" data-journey="select"><b>01</b><span>选择相机<small>Azure Kinect / RealSense</small></span></li>
+        <li data-journey="record"><b>02</b><span>录制场景<small>保存 MKV 或 BAG</small></span></li>
+        <li data-journey="convert"><b>03</b><span>转换重建<small>生成 integrated.ply</small></span></li>
+      </ol>
+    </section>
+
+    <section class="workspace">
+      <div class="control-column">
+        <section class="panel camera-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">STEP 01</span>
+              <h2>选择相机硬件</h2>
+            </div>
+            <button id="refresh-devices" class="quiet-button" type="button">重新检测</button>
+          </div>
+
+          <fieldset class="camera-grid" aria-label="相机硬件">
+            <label class="camera-card" data-hardware="azure-kinect">
+              <input type="radio" name="hardware" value="azure-kinect">
+              <span class="camera-visual azure-visual" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span class="camera-copy">
+                <strong>Azure Kinect DK</strong>
+                <small>MKV · Color + Depth + IMU</small>
+              </span>
+              <span class="device-state checking" data-device-state="azure-kinect">检测中</span>
+            </label>
+
+            <label class="camera-card" data-hardware="d435">
+              <input type="radio" name="hardware" value="d435">
+              <span class="camera-visual rs-visual" aria-hidden="true"><i></i><i></i></span>
+              <span class="camera-copy">
+                <strong>RealSense D435</strong>
+                <small>BAG · Color + Depth</small>
+              </span>
+              <span class="device-state checking" data-device-state="d435">检测中</span>
+            </label>
+
+            <label class="camera-card" data-hardware="d435i">
+              <input type="radio" name="hardware" value="d435i">
+              <span class="camera-visual rs-visual rs-i-visual" aria-hidden="true"><i></i><i></i></span>
+              <span class="camera-copy">
+                <strong>RealSense D435i</strong>
+                <small>BAG · Color + Depth · IMU 状态</small>
+              </span>
+              <span class="device-state checking" data-device-state="d435i">检测中</span>
+            </label>
+          </fieldset>
+          <p id="device-hint" class="hint">选择前会检测已接入的设备；即使暂未发现，也可在接入后重新检测。</p>
+        </section>
+
+        <section id="session-panel" class="panel session-panel muted-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step-label">STEP 02—03</span>
+              <h2>录制与转换</h2>
+            </div>
+            <div id="phase-badge" class="phase-badge idle"><span></span>等待选择</div>
+          </div>
+
+          <div class="settings-grid">
+            <label>
+              <span>设备编号</span>
+              <select id="device-index" disabled>
+                <option value="0">设备 0</option>
+              </select>
+            </label>
+            <label>
+              <span>录制名称 <small>可选</small></span>
+              <input id="recording-name" type="text" maxlength="64" placeholder="自动使用时间戳" disabled>
+            </label>
+            <label>
+              <span>帧步长</span>
+              <select id="frame-stride" disabled>
+                <option value="1">保留每一帧</option>
+                <option value="2">每 2 帧保留 1 帧</option>
+                <option value="3">每 3 帧保留 1 帧</option>
+                <option value="4">每 4 帧保留 1 帧</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="action-row">
+            <button id="start-recording" class="action primary" type="button" disabled>
+              <span class="button-icon record-icon"></span>
+              <span><strong>开始录制</strong><small>保存原始 RGB-D 数据</small></span>
+            </button>
+            <button id="stop-recording" class="action danger" type="button" disabled>
+              <span class="button-icon stop-icon"></span>
+              <span><strong>结束录制</strong><small>封装并安全保存文件</small></span>
+            </button>
+            <button id="start-conversion" class="action convert" type="button" disabled>
+              <span class="button-icon convert-icon"></span>
+              <span><strong>开始转换</strong><small>提取帧并完整重建</small></span>
+            </button>
+          </div>
+
+          <div id="task-summary" class="task-summary" aria-live="polite">
+            <span class="summary-pulse"></span>
+            <div><strong>请先选择相机</strong><small>相机选定后即可开始录制</small></div>
+          </div>
+          <div id="error-banner" class="error-banner" role="alert" hidden></div>
+        </section>
+      </div>
+
+      <aside class="monitor-column">
+        <section class="panel monitor-panel">
+          <div class="panel-heading compact">
+            <div>
+              <span class="step-label">LIVE STATUS</span>
+              <h2>任务监视器</h2>
+            </div>
+            <span id="server-indicator" class="server-indicator online"><i></i>已连接</span>
+          </div>
+
+          <dl class="metrics">
+            <div><dt>硬件</dt><dd id="metric-hardware">—</dd></div>
+            <div><dt>录制文件</dt><dd id="metric-recording">—</dd></div>
+            <div><dt>数据集</dt><dd id="metric-dataset">—</dd></div>
+          </dl>
+
+          <div class="log-heading"><span>PROCESS OUTPUT</span><button id="copy-log" type="button">复制日志</button></div>
+          <pre id="log-output" class="log-output" tabindex="0"><span class="log-placeholder">任务日志将在这里显示。</span></pre>
+        </section>
+      </aside>
+    </section>
+
+    <section id="process-panel" class="panel process-panel" hidden>
+      <div class="panel-heading process-heading">
+        <div>
+          <span id="process-kicker" class="step-label">LIVE CAPTURE</span>
+          <h2 id="process-title">实时采集画面</h2>
+        </div>
+        <div class="process-meta">
+          <span id="process-frame-rate">等待视频流</span>
+          <span id="process-frame-count">0 帧</span>
+        </div>
+      </div>
+
+      <div id="capture-visual" class="capture-visual">
+        <figure class="stream-card">
+          <figcaption><span>RGB</span><small id="rgb-resolution">等待彩色帧</small></figcaption>
+          <div class="stream-viewport">
+            <img id="live-rgb" alt="相机实时 RGB 画面">
+            <span id="rgb-placeholder" class="stream-placeholder">正在连接彩色数据流…</span>
+          </div>
+        </figure>
+        <figure class="stream-card">
+          <figcaption><span>DEPTH</span><small id="depth-range">0.3—3.0 m 伪彩</small></figcaption>
+          <div class="stream-viewport">
+            <img id="live-depth" alt="相机实时深度伪彩画面">
+            <span id="depth-placeholder" class="stream-placeholder">正在连接深度数据流…</span>
+            <span class="depth-scale" aria-hidden="true"><i></i><small>近</small><small>远</small></span>
+          </div>
+        </figure>
+        <section class="imu-card" aria-labelledby="imu-title">
+          <div class="imu-heading">
+            <div><span>IMU</span><strong id="imu-title">运动传感器</strong></div>
+            <span id="imu-status" class="sensor-status waiting">等待数据</span>
+          </div>
+          <div class="imu-vectors">
+            <div>
+              <small>ACCEL · m/s²</small>
+              <strong id="imu-accel">— · — · —</strong>
+              <span id="imu-accel-magnitude">|a| —</span>
+            </div>
+            <div>
+              <small>GYRO · rad/s</small>
+              <strong id="imu-gyro">— · — · —</strong>
+              <span id="imu-gyro-magnitude">|ω| —</span>
+            </div>
+          </div>
+          <canvas id="imu-chart" aria-label="IMU 最近采样趋势"></canvas>
+          <div class="imu-footer">
+            <span id="imu-temperature">温度 —</span>
+            <span id="imu-rate">采样率 —</span>
+          </div>
+          <p id="imu-message">相机开始录制后显示传感器能力与实时数值。</p>
+        </section>
+      </div>
+
+      <div id="conversion-visual" class="conversion-visual" hidden>
+        <ol id="pipeline-steps" class="pipeline-steps" aria-label="转换重建进度">
+          <li data-stage="extract"><b>01</b><span>提取帧</span></li>
+          <li data-stage="make"><b>02</b><span>局部片段</span></li>
+          <li data-stage="register"><b>03</b><span>全局配准</span></li>
+          <li data-stage="refine"><b>04</b><span>精细配准</span></li>
+          <li data-stage="integrate"><b>05</b><span>TSDF 融合</span></li>
+        </ol>
+        <div class="pipeline-progress" aria-hidden="true"><i id="pipeline-progress-bar"></i></div>
+        <div class="pipeline-detail">
+          <strong id="pipeline-label">正在准备转换</strong>
+          <span id="pipeline-detail">等待首个中间产物</span>
+        </div>
+        <div id="conversion-placeholder" class="conversion-placeholder">中间 RGB-D 帧或局部点云生成后会自动显示在这里。</div>
+        <div id="conversion-rgbd" class="conversion-rgbd" hidden>
+          <figure class="stream-card"><figcaption><span>EXTRACTED RGB</span><small>最新已完成帧</small></figcaption><div class="stream-viewport"><img id="process-rgb" alt="转换过程中最新提取的彩色帧"></div></figure>
+          <figure class="stream-card"><figcaption><span>EXTRACTED DEPTH</span><small>最新已完成帧 · 伪彩</small></figcaption><div class="stream-viewport"><img id="process-depth" alt="转换过程中最新提取的深度帧"></div></figure>
+        </div>
+        <div id="conversion-model" class="conversion-model" hidden>
+          <canvas id="process-viewer" aria-label="转换过程中的局部点云预览"></canvas>
+          <div id="process-viewer-message" class="viewer-message">正在载入局部点云…</div>
+          <div id="process-model-label" class="viewer-help">最新局部片段</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="result-panel" class="panel result-panel" hidden>
+      <div class="result-copy">
+        <span class="step-label success-label">RECONSTRUCTION READY</span>
+        <h2>三维场景已经生成</h2>
+        <p>拖动模型旋转视角，滚轮缩放。浏览器预览会对顶点采样，下载的 PLY 文件保持完整精度。</p>
+        <div class="result-meta">
+          <span><small>网格文件</small><strong id="result-name">integrated.ply</strong></span>
+          <span><small>文件大小</small><strong id="result-size">—</strong></span>
+        </div>
+        <div class="result-links">
+          <a id="download-mesh" class="download-link" href="/api/files/mesh" download>下载完整 PLY</a>
+          <a id="download-recording" class="text-link" href="/api/files/recording">下载原始录制</a>
+        </div>
+      </div>
+      <div class="viewer-wrap">
+        <canvas id="model-viewer" aria-label="重建点云预览"></canvas>
+        <div id="viewer-message" class="viewer-message">正在载入模型预览…</div>
+        <div class="viewer-help">拖动旋转 · 滚轮缩放 · 双击复位</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>OPEN3D RECONSTRUCT</span>
+    <span>数据与依赖均保存在当前项目目录</span>
+  </footer>
+</body>
+</html>

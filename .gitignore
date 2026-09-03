@@ -1,0 +1,50 @@
+# Local Python runtimes, downloaded tools, and native SDK dependencies
+/.venv/
+/.python/
+/.tools/
+/.deps/
+
+# Runtime state and caches
+/.cache/
+/.run/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/.coverage.*
+/coverage.xml
+/htmlcov/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs, crash dumps, and temporary files
+*.log
+*.pid
+*.tmp
+*.bak
+*.old
+/core
+/core.*
+/nohup.out
+
+# Camera captures, extracted RGB-D frames, and reconstruction outputs are local.
+*.mkv
+*.bag
+/data/

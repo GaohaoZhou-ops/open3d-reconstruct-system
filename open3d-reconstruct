@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+K4A_LIB="$PROJECT_ROOT/.deps/k4a/usr/lib/x86_64-linux-gnu"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "环境尚未安装。请先运行：./setup.sh" >&2
+    exit 2
+fi
+
+export OPEN3D_RECONSTRUCT_ROOT="$PROJECT_ROOT"
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export XDG_CACHE_HOME="$PROJECT_ROOT/.cache"
+export OPEN3D_DATA_ROOT="$PROJECT_ROOT/.cache/open3d-data"
+export MPLCONFIGDIR="$PROJECT_ROOT/.cache/matplotlib"
+export UV_CACHE_DIR="$PROJECT_ROOT/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$PROJECT_ROOT/.python"
+export UV_PYTHON_BIN_DIR="$PROJECT_ROOT/.python/bin"
+export UV_TOOL_DIR="$PROJECT_ROOT/.tools/uv-tools"
+export UV_TOOL_BIN_DIR="$PROJECT_ROOT/.tools/uv-tool-bin"
+
+if [[ -d "$K4A_LIB" ]]; then
+    export LD_LIBRARY_PATH="$K4A_LIB:$K4A_LIB/libk4a1.4${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+unset PYTHONHOME PYTHONPATH
+exec "$PYTHON_BIN" -B -I -u -m open3d_reconstruct "$@"
