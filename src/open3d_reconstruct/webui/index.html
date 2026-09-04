@@ -230,10 +230,24 @@
           <div id="viewer-message" class="viewer-message">正在载入模型预览…</div>
           <div id="model-viewer-style" class="viewer-style-switch" role="group" aria-label="模型预览风格">
             <button type="button" data-viewer-style="points" aria-pressed="true">点云</button>
-            <button type="button" data-viewer-style="mesh" aria-pressed="false" disabled>网格</button>
+            <button type="button" data-viewer-style="mesh" aria-pressed="false" disabled>彩色面</button>
+            <button type="button" data-viewer-style="solid" aria-pressed="false" disabled>结构面</button>
+          </div>
+          <div id="model-viewer-navigation" class="viewer-navigation" role="group" aria-label="模型交互工具">
+            <button type="button" data-viewer-navigation="rotate" aria-pressed="true">旋转</button>
+            <button type="button" data-viewer-navigation="pan" aria-pressed="false">平移</button>
+            <button type="button" data-viewer-navigation="reset" title="恢复初始视角">复位</button>
+          </div>
+          <div id="model-viewer-scale" class="viewer-scale" role="img" aria-label="模型比例尺" hidden>
+            <div class="viewer-scale-heading">
+              <strong id="model-viewer-scale-value">—</strong>
+              <small>中心平面</small>
+            </div>
+            <div id="model-viewer-scale-bar" class="viewer-scale-bar" aria-hidden="true"></div>
+            <small id="model-viewer-bounds" class="viewer-scale-bounds">XYZ —</small>
           </div>
           <canvas id="model-viewer-orientation" class="viewer-orientation" aria-label="重建模型 XYZ 朝向"></canvas>
-          <div class="viewer-help">任意方向拖动旋转 · 滚轮缩放 · 双击复位</div>
+          <div class="viewer-help">左键旋转 · 右键 / Shift + 拖动平移 · 滚轮缩放 · 按键复位</div>
         </div>
       </section>
 

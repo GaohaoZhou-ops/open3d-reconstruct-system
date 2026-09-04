@@ -507,8 +507,15 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"matching-heatmap", page)
         self.assertIn(b"model-viewer-orientation", page)
         self.assertIn(b"model-mesh-viewer", page)
+        self.assertIn(b"model-viewer-navigation", page)
+        self.assertIn(b"model-viewer-scale", page)
+        self.assertIn(b"model-viewer-bounds", page)
         self.assertIn("点云".encode(), page)
         self.assertIn("网格".encode(), page)
+        self.assertIn("彩色面".encode(), page)
+        self.assertIn("结构面".encode(), page)
+        self.assertIn("平移".encode(), page)
+        self.assertIn("中心平面".encode(), page)
         self.assertIn(b"process-viewer-orientation", page)
         self.assertIn("信息矩阵迹".encode(), page)
         self.assertIn(b"empty-stage", page)
@@ -522,6 +529,17 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"class MatchingDiagnostics", script)
         self.assertIn(b"class ViewerOrientation", script)
         self.assertIn(b"class MeshRenderer", script)
+        self.assertIn(b"meshNormals", script)
+        self.assertIn(b"gl.drawElements", script)
+        self.assertIn(b"viewerNavigationButtons", script)
+        self.assertIn(b"gl.uniform2f", script)
+        self.assertIn(b"this.panX", script)
+        self.assertNotIn(b'addEventListener("dblclick"', script)
+        self.assertIn(b'data-viewer-navigation="reset"', page)
+        self.assertNotIn("双击复位".encode(), page)
+        self.assertIn(b"niceScaleLength", script)
+        self.assertIn(b"formatSceneDimensions", script)
+        self.assertIn(b"this.modelExtent", script)
         self.assertIn(b"mesh_preview_url", script)
         self.assertIn(b"/api/recording/select-local", script)
         self.assertIn(b"/api/recordings/delete", script)
@@ -532,6 +550,8 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b".camera-card", style)
         self.assertIn(b".capture-visual", style)
         self.assertIn(b".live-frame.active", style)
+        self.assertIn(b".viewer-navigation", style)
+        self.assertIn(b".viewer-scale-bar", style)
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
 
     def test_state_api_starts_idle(self) -> None:
@@ -704,10 +724,14 @@ class WebHttpTests(unittest.TestCase):
                 state["mesh_preview_url"], "/api/files/mesh-preview"
             )
 
-            preview_payload, headers = self.get("/api/files/mesh-preview")
+            with mock.patch(
+                "open3d_reconstruct.web.MESH_PREVIEW_TARGET_TRIANGLES", 1
+            ):
+                preview_payload, headers = self.get("/api/files/mesh-preview")
             self.assertTrue(preview_payload.startswith(b"ply\n"))
+            self.assertIn(b"element face 1\n", preview_payload)
             self.assertEqual(headers["Content-Type"], "model/ply")
-            preview = source.with_name("integrated.preview.ply")
+            preview = source.with_name("integrated.preview-v2.ply")
             self.assertTrue(preview.is_file())
             preview_mtime = preview.stat().st_mtime_ns
 

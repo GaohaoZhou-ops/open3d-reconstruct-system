@@ -40,8 +40,8 @@ MAX_MATCHING_EVENTS = 2000
 MAX_RECORDING_UPLOAD_BYTES = 256 * 1024**3
 RECORDING_UPLOAD_CHUNK_BYTES = 4 * 1024**2
 MIN_FREE_STORAGE_BYTES = 256 * 1024**2
-MESH_PREVIEW_TARGET_TRIANGLES = 120_000
-MESH_PREVIEW_CLUSTER_RESOLUTION = 180
+MESH_PREVIEW_TARGET_TRIANGLES = 500_000
+MESH_PREVIEW_CACHE_VERSION = 2
 WEB_MATCH_PREFIX = "__OPEN3D_WEB_MATCH__ "
 PIPELINE_STEPS = (
     ("extract", "提取 RGB-D 帧"),
@@ -1907,7 +1907,9 @@ class ControlCenter:
         source = self.result_file("mesh")
         if source is None:
             return None
-        preview = source.with_name(f"{source.stem}.preview.ply")
+        preview = source.with_name(
+            f"{source.stem}.preview-v{MESH_PREVIEW_CACHE_VERSION}.ply"
+        )
 
         def cache_is_current() -> bool:
             try:
@@ -1948,16 +1950,9 @@ class ControlCenter:
 
                 preview_mesh = mesh
                 if source_triangles > MESH_PREVIEW_TARGET_TRIANGLES:
-                    extent = max(mesh.get_axis_aligned_bounding_box().get_extent())
-                    if math.isfinite(extent) and extent > 0:
-                        preview_mesh = mesh.simplify_vertex_clustering(
-                            voxel_size=extent / MESH_PREVIEW_CLUSTER_RESOLUTION,
-                            contraction=o3d.geometry.SimplificationContraction.Average,
-                        )
-                    if len(preview_mesh.triangles) > MESH_PREVIEW_TARGET_TRIANGLES:
-                        preview_mesh = preview_mesh.simplify_quadric_decimation(
-                            target_number_of_triangles=MESH_PREVIEW_TARGET_TRIANGLES,
-                        )
+                    preview_mesh = mesh.simplify_quadric_decimation(
+                        target_number_of_triangles=MESH_PREVIEW_TARGET_TRIANGLES,
+                    )
                 preview_mesh.remove_degenerate_triangles()
                 preview_mesh.remove_duplicated_triangles()
                 preview_mesh.remove_unreferenced_vertices()

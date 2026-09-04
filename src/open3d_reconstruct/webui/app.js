@@ -2,6 +2,7 @@
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+const MAX_MESH_PREVIEW_FACES = 600000;
 
 const elements = {
   cameraCards: $$(".camera-card"),
@@ -92,6 +93,11 @@ const elements = {
   viewerMessage: $("#viewer-message"),
   viewerOrientation: $("#model-viewer-orientation"),
   viewerStyleButtons: $$("#model-viewer-style [data-viewer-style]"),
+  viewerNavigationButtons: $$("#model-viewer-navigation [data-viewer-navigation]"),
+  viewerScale: $("#model-viewer-scale"),
+  viewerScaleBar: $("#model-viewer-scale-bar"),
+  viewerScaleValue: $("#model-viewer-scale-value"),
+  viewerBounds: $("#model-viewer-bounds"),
   recordingManagerDialog: $("#recording-manager-dialog"),
   closeRecordingManager: $("#close-recording-manager"),
   refreshRecordings: $("#refresh-recordings"),
@@ -195,6 +201,50 @@ function formatBytes(bytes) {
   const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / (1024 ** exponent);
   return `${value.toFixed(value >= 100 || exponent === 0 ? 0 : value >= 10 ? 1 : 2)} ${units[exponent]}`;
+}
+
+function sceneLengthUnit(meters) {
+  if (meters >= 1000) return { multiplier: 0.001, unit: "km" };
+  if (meters >= 1) return { multiplier: 1, unit: "m" };
+  if (meters >= 0.01) return { multiplier: 100, unit: "cm" };
+  return { multiplier: 1000, unit: "mm" };
+}
+
+function formatSceneNumber(value) {
+  const digits = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: digits });
+}
+
+function formatSceneLength(meters) {
+  if (!Number.isFinite(meters) || meters <= 0) return "—";
+  const { multiplier, unit } = sceneLengthUnit(meters);
+  return `${formatSceneNumber(meters * multiplier)} ${unit}`;
+}
+
+function formatSceneDimensions(dimensions) {
+  if (!Array.isArray(dimensions) || dimensions.some((value) => !Number.isFinite(value))) {
+    return "XYZ —";
+  }
+  const maximum = Math.max(...dimensions);
+  const { multiplier, unit } = sceneLengthUnit(maximum);
+  const values = dimensions.map((value) => formatSceneNumber(value * multiplier));
+  return `XYZ ${values.join(" × ")} ${unit}`;
+}
+
+function niceScaleLength(targetMeters) {
+  if (!Number.isFinite(targetMeters) || targetMeters <= 0) return null;
+  const magnitude = 10 ** Math.floor(Math.log10(targetMeters));
+  let best = magnitude;
+  let bestDistance = Infinity;
+  for (const factor of [1, 2, 5, 10]) {
+    const candidate = factor * magnitude;
+    const distance = Math.abs(Math.log(candidate / targetMeters));
+    if (distance < bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 
 function formatDuration(seconds) {
@@ -1877,12 +1927,16 @@ function parseBinaryVertices(buffer, info) {
   const hasFaces = info.faceCount > 0;
   const meshPositions = hasFaces ? new Float32Array(info.vertexCount * 3) : null;
   const meshColors = hasFaces ? new Uint8Array(info.vertexCount * 3) : null;
+  const hasNormals = Boolean(byName.nx && byName.ny && byName.nz);
+  const meshNormals = hasFaces && hasNormals
+    ? new Float32Array(info.vertexCount * 3)
+    : null;
   let output = 0;
   const read = (base, property) => view[property.getter](base + property.offset, littleEndian);
   const red = byName.red || byName.r;
   const green = byName.green || byName.g;
   const blue = byName.blue || byName.b;
-  const readVertex = (index, targetPositions, targetColors, targetIndex) => {
+  const readVertex = (index, targetPositions, targetColors, targetIndex, targetNormals = null) => {
     const base = info.dataOffset + index * stride;
     const offset = targetIndex * 3;
     targetPositions[offset] = read(base, byName.x);
@@ -1891,10 +1945,15 @@ function parseBinaryVertices(buffer, info) {
     targetColors[offset] = red ? normalizedColor(read(base, red), red.type) : 199;
     targetColors[offset + 1] = green ? normalizedColor(read(base, green), green.type) : 243;
     targetColors[offset + 2] = blue ? normalizedColor(read(base, blue), blue.type) : 107;
+    if (targetNormals) {
+      targetNormals[offset] = read(base, byName.nx);
+      targetNormals[offset + 1] = read(base, byName.ny);
+      targetNormals[offset + 2] = read(base, byName.nz);
+    }
   };
   if (hasFaces) {
     for (let index = 0; index < info.vertexCount; index += 1) {
-      readVertex(index, meshPositions, meshColors, index);
+      readVertex(index, meshPositions, meshColors, index, meshNormals);
       if (index % step === 0) {
         const sourceOffset = index * 3;
         positions.set(meshPositions.subarray(sourceOffset, sourceOffset + 3), output * 3);
@@ -1911,51 +1970,46 @@ function parseBinaryVertices(buffer, info) {
 
   let indices = null;
   if (hasFaces) {
-    if (info.faceCount > 250000) {
+    if (info.faceCount > MAX_MESH_PREVIEW_FACES) {
       throw new Error("网格预览面数过多，请刷新页面以生成轻量预览");
     }
     indices = new Uint32Array(info.faceCount * 3);
     let faceOffset = needed;
-    let triangle = 0;
-    const readTyped = (offset, type) => {
+    const readFaceValue = (type) => {
       const [size, getter] = plyTypes[type];
-      if (offset + size > buffer.byteLength) throw new Error("PLY 面数据不完整");
-      return [view[getter](offset, littleEndian), offset + size];
+      if (faceOffset + size > buffer.byteLength) throw new Error("PLY 面数据不完整");
+      const value = view[getter](faceOffset, littleEndian);
+      faceOffset += size;
+      return value;
     };
     for (let face = 0; face < info.faceCount; face += 1) {
-      let vertexIndices = null;
+      let faceVertexCount = 0;
+      const targetOffset = face * 3;
       for (const property of info.faceProperties) {
         if (!property.list) {
-          [, faceOffset] = readTyped(faceOffset, property.type);
+          readFaceValue(property.type);
           continue;
         }
-        let count;
-        [count, faceOffset] = readTyped(faceOffset, property.countType);
+        const count = readFaceValue(property.countType);
         if (!Number.isSafeInteger(count) || count < 0 || count > 1024) {
           throw new Error("PLY 面索引数量无效");
         }
-        const values = [];
+        const isVertexList = ["vertex_indices", "vertex_index"].includes(property.name);
+        if (isVertexList) faceVertexCount = count;
         for (let item = 0; item < count; item += 1) {
-          let value;
-          [value, faceOffset] = readTyped(faceOffset, property.itemType);
-          if (["vertex_indices", "vertex_index"].includes(property.name)) values.push(value);
-        }
-        if (["vertex_indices", "vertex_index"].includes(property.name)) {
-          vertexIndices = values;
+          const value = readFaceValue(property.itemType);
+          if (isVertexList && item < 3) indices[targetOffset + item] = value;
         }
       }
-      if (!vertexIndices || vertexIndices.length !== 3) {
+      if (faceVertexCount !== 3) {
         throw new Error("网格预览目前仅支持三角面");
       }
-      for (const vertexIndex of vertexIndices) {
+      for (let offset = 0; offset < 3; offset += 1) {
+        const vertexIndex = indices[targetOffset + offset];
         if (!Number.isSafeInteger(vertexIndex) || vertexIndex < 0 || vertexIndex >= info.vertexCount) {
           throw new Error("PLY 三角面包含无效顶点索引");
         }
       }
-      indices[triangle * 3] = vertexIndices[0];
-      indices[triangle * 3 + 1] = vertexIndices[1];
-      indices[triangle * 3 + 2] = vertexIndices[2];
-      triangle += 1;
     }
   }
   return {
@@ -1963,6 +2017,7 @@ function parseBinaryVertices(buffer, info) {
     colors,
     meshPositions,
     meshColors,
+    meshNormals,
     indices,
     sourceCount: info.vertexCount,
     faceCount: info.faceCount,
@@ -1988,6 +2043,10 @@ function parseAsciiVertices(buffer, info) {
   const meshPositions = hasFaces ? new Float32Array(info.vertexCount * 3) : null;
   const meshColors = hasFaces ? new Uint8Array(info.vertexCount * 3) : null;
   const propertyIndex = Object.fromEntries(info.properties.map((property, index) => [property.name, index]));
+  const hasNormals = ["nx", "ny", "nz"].every((name) => propertyIndex[name] !== undefined);
+  const meshNormals = hasFaces && hasNormals
+    ? new Float32Array(info.vertexCount * 3)
+    : null;
   let output = 0;
   for (let index = 0; index < info.vertexCount; index += 1) {
     const values = info.properties.map(() => Number(nextToken()));
@@ -2009,6 +2068,11 @@ function parseAsciiVertices(buffer, info) {
     if (hasFaces) {
       meshPositions.set(vertex, index * 3);
       meshColors.set(vertexColor, index * 3);
+      if (meshNormals) {
+        meshNormals[index * 3] = values[propertyIndex.nx];
+        meshNormals[index * 3 + 1] = values[propertyIndex.ny];
+        meshNormals[index * 3 + 2] = values[propertyIndex.nz];
+      }
     }
     if (index % step === 0) {
       positions.set(vertex, output * 3);
@@ -2019,12 +2083,13 @@ function parseAsciiVertices(buffer, info) {
 
   let indices = null;
   if (hasFaces) {
-    if (info.faceCount > 250000) {
+    if (info.faceCount > MAX_MESH_PREVIEW_FACES) {
       throw new Error("网格预览面数过多，请刷新页面以生成轻量预览");
     }
     indices = new Uint32Array(info.faceCount * 3);
     for (let face = 0; face < info.faceCount; face += 1) {
-      let vertexIndices = null;
+      let faceVertexCount = 0;
+      const targetOffset = face * 3;
       for (const property of info.faceProperties) {
         if (!property.list) {
           nextToken();
@@ -2034,21 +2099,22 @@ function parseAsciiVertices(buffer, info) {
         if (!Number.isSafeInteger(count) || count < 0 || count > 1024) {
           throw new Error("PLY 面索引数量无效");
         }
-        const values = [];
-        for (let item = 0; item < count; item += 1) values.push(Number(nextToken()));
-        if (["vertex_indices", "vertex_index"].includes(property.name)) {
-          vertexIndices = values;
+        const isVertexList = ["vertex_indices", "vertex_index"].includes(property.name);
+        if (isVertexList) faceVertexCount = count;
+        for (let item = 0; item < count; item += 1) {
+          const value = Number(nextToken());
+          if (isVertexList && item < 3) indices[targetOffset + item] = value;
         }
       }
-      if (!vertexIndices || vertexIndices.length !== 3) {
+      if (faceVertexCount !== 3) {
         throw new Error("网格预览目前仅支持三角面");
       }
-      vertexIndices.forEach((vertexIndex, offset) => {
+      for (let offset = 0; offset < 3; offset += 1) {
+        const vertexIndex = indices[targetOffset + offset];
         if (!Number.isSafeInteger(vertexIndex) || vertexIndex < 0 || vertexIndex >= info.vertexCount) {
           throw new Error("PLY 三角面包含无效顶点索引");
         }
-        indices[face * 3 + offset] = vertexIndex;
-      });
+      }
     }
   }
   return {
@@ -2056,6 +2122,7 @@ function parseAsciiVertices(buffer, info) {
     colors,
     meshPositions,
     meshColors,
+    meshNormals,
     indices,
     sourceCount: info.vertexCount,
     faceCount: info.faceCount,
@@ -2230,7 +2297,8 @@ class MeshRenderer {
       premultipliedAlpha: false,
     });
     this.available = Boolean(this.gl);
-    this.vertexCount = 0;
+    this.indexCount = 0;
+    this.surfaceMode = 0;
     this.error = null;
     if (!this.available) {
       this.error = "当前浏览器不支持 WebGL 2";
@@ -2268,8 +2336,10 @@ class MeshRenderer {
       uniform float u_pitch;
       uniform float u_zoom;
       uniform float u_aspect;
+      uniform vec2 u_pan;
       out vec3 v_normal;
-      out vec3 v_color;
+      out vec3 v_linear_color;
+      out vec3 v_view_position;
 
       vec3 rotate_model(vec3 point) {
         float cy = cos(u_yaw);
@@ -2288,33 +2358,44 @@ class MeshRenderer {
         float far_plane = 10.0;
         float projection_a = (far_plane + near_plane) / (far_plane - near_plane);
         float projection_b = (-2.0 * far_plane * near_plane) / (far_plane - near_plane);
-        float scale = 3.1 * u_zoom;
+        float scale = 3.1 * u_zoom * min(1.0, u_aspect);
         gl_Position = vec4(
           point.x * scale / u_aspect,
           point.y * scale,
           projection_a * depth + projection_b,
           depth
         );
+        gl_Position.xy += u_pan * depth;
         v_normal = rotate_model(a_normal);
-        v_color = a_color;
+        v_linear_color = pow(max(a_color, vec3(0.001)), vec3(2.2));
+        v_view_position = point;
       }
     `);
     const fragmentShader = this.compile(gl.FRAGMENT_SHADER, `#version 300 es
       precision highp float;
       in vec3 v_normal;
-      in vec3 v_color;
+      in vec3 v_linear_color;
+      in vec3 v_view_position;
+      uniform float u_surface_mode;
       out vec4 output_color;
 
       void main() {
         vec3 normal = normalize(v_normal);
         if (!gl_FrontFacing) normal = -normal;
-        vec3 light = normalize(vec3(-0.38, 0.72, 0.58));
-        float diffuse = max(dot(normal, light), 0.0);
-        float fill = max(dot(normal, -light), 0.0) * 0.12;
-        float rim = pow(1.0 - abs(normal.z), 2.0) * 0.10;
-        vec3 linear_color = pow(max(v_color, vec3(0.001)), vec3(2.2));
-        vec3 lit = linear_color * (0.34 + 0.78 * diffuse + fill) + vec3(rim);
-        output_color = vec4(pow(max(lit, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+        vec3 key_light = normalize(vec3(-0.42, 0.72, 0.56));
+        vec3 fill_light = normalize(vec3(0.55, -0.18, 0.82));
+        vec3 view_direction = normalize(vec3(0.0, 0.0, 2.35) - v_view_position);
+        vec3 half_direction = normalize(key_light + view_direction);
+        float diffuse = max(dot(normal, key_light), 0.0);
+        float fill = max(dot(normal, fill_light), 0.0);
+        float specular = pow(max(dot(normal, half_direction), 0.0), 32.0);
+        float rim = pow(1.0 - max(dot(normal, view_direction), 0.0), 2.4);
+        vec3 neutral = vec3(0.43, 0.49, 0.47);
+        vec3 base_color = mix(v_linear_color, neutral, u_surface_mode);
+        vec3 lit = base_color * (0.28 + 0.82 * diffuse + 0.18 * fill);
+        lit += vec3(0.12 * specular + 0.07 * rim);
+        vec3 mapped = lit / (lit + vec3(0.82));
+        output_color = vec4(pow(max(mapped, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
       }
     `);
     this.program = gl.createProgram();
@@ -2331,22 +2412,40 @@ class MeshRenderer {
       pitch: gl.getUniformLocation(this.program, "u_pitch"),
       zoom: gl.getUniformLocation(this.program, "u_zoom"),
       aspect: gl.getUniformLocation(this.program, "u_aspect"),
+      pan: gl.getUniformLocation(this.program, "u_pan"),
+      surfaceMode: gl.getUniformLocation(this.program, "u_surface_mode"),
     };
     this.vao = gl.createVertexArray();
     this.buffers = [];
   }
 
   clear() {
-    this.vertexCount = 0;
+    this.indexCount = 0;
     if (this.available) this.render(-0.55, -0.28, 1);
   }
 
-  setModel(positions, colors, indices) {
-    if (!this.available) throw new Error(this.error || "WebGL 2 不可用");
-    const trianglePositions = new Float32Array(indices.length * 3);
-    const triangleNormals = new Float32Array(indices.length * 3);
-    const triangleColors = new Uint8Array(indices.length * 3);
-    let output = 0;
+  setSurfaceMode(mode) {
+    this.surfaceMode = mode === "solid" ? 1 : 0;
+  }
+
+  prepareNormals(positions, normals, indices) {
+    const prepared = new Float32Array(positions.length);
+    let useProvided = Boolean(normals && normals.length === positions.length);
+    if (useProvided) {
+      for (let offset = 0; offset < normals.length; offset += 3) {
+        const length = Math.hypot(normals[offset], normals[offset + 1], normals[offset + 2]);
+        if (!Number.isFinite(length) || length < 1e-8) {
+          useProvided = false;
+          break;
+        }
+        prepared[offset] = normals[offset] / length;
+        prepared[offset + 1] = normals[offset + 1] / length;
+        prepared[offset + 2] = normals[offset + 2] / length;
+      }
+    }
+    if (useProvided) return prepared;
+
+    prepared.fill(0);
     for (let index = 0; index < indices.length; index += 3) {
       const ia = indices[index] * 3;
       const ib = indices[index + 1] * 3;
@@ -2357,29 +2456,37 @@ class MeshRenderer {
       const acx = positions[ic] - positions[ia];
       const acy = positions[ic + 1] - positions[ia + 1];
       const acz = positions[ic + 2] - positions[ia + 2];
-      let nx = aby * acz - abz * acy;
-      let ny = abz * acx - abx * acz;
-      let nz = abx * acy - aby * acx;
-      const length = Math.hypot(nx, ny, nz);
-      if (!Number.isFinite(length) || length < 1e-10) continue;
-      nx /= length;
-      ny /= length;
-      nz /= length;
-      for (const sourceOffset of [ia, ib, ic]) {
-        const targetOffset = output * 3;
-        trianglePositions[targetOffset] = positions[sourceOffset];
-        trianglePositions[targetOffset + 1] = positions[sourceOffset + 1];
-        trianglePositions[targetOffset + 2] = positions[sourceOffset + 2];
-        triangleNormals[targetOffset] = nx;
-        triangleNormals[targetOffset + 1] = ny;
-        triangleNormals[targetOffset + 2] = nz;
-        triangleColors[targetOffset] = colors[sourceOffset];
-        triangleColors[targetOffset + 1] = colors[sourceOffset + 1];
-        triangleColors[targetOffset + 2] = colors[sourceOffset + 2];
-        output += 1;
+      const nx = aby * acz - abz * acy;
+      const ny = abz * acx - abx * acz;
+      const nz = abx * acy - aby * acx;
+      if (!Number.isFinite(nx + ny + nz)) continue;
+      for (const offset of [ia, ib, ic]) {
+        prepared[offset] += nx;
+        prepared[offset + 1] += ny;
+        prepared[offset + 2] += nz;
       }
     }
-    if (!output) throw new Error("网格没有有效三角面");
+    for (let offset = 0; offset < prepared.length; offset += 3) {
+      const length = Math.hypot(prepared[offset], prepared[offset + 1], prepared[offset + 2]);
+      if (!Number.isFinite(length) || length < 1e-8) {
+        prepared[offset] = 0;
+        prepared[offset + 1] = 0;
+        prepared[offset + 2] = 1;
+        continue;
+      }
+      prepared[offset] /= length;
+      prepared[offset + 1] /= length;
+      prepared[offset + 2] /= length;
+    }
+    return prepared;
+  }
+
+  setModel(positions, normals, colors, indices) {
+    if (!this.available) throw new Error(this.error || "WebGL 2 不可用");
+    if (!positions.length || !indices.length || indices.length % 3 !== 0) {
+      throw new Error("网格没有有效三角面");
+    }
+    const preparedNormals = this.prepareNormals(positions, normals, indices);
 
     const gl = this.gl;
     for (const buffer of this.buffers) gl.deleteBuffer(buffer);
@@ -2393,14 +2500,18 @@ class MeshRenderer {
       gl.enableVertexAttribArray(location);
       gl.vertexAttribPointer(location, size, type, normalized, 0, 0);
     };
-    upload(0, trianglePositions.subarray(0, output * 3), 3, gl.FLOAT);
-    upload(1, triangleNormals.subarray(0, output * 3), 3, gl.FLOAT);
-    upload(2, triangleColors.subarray(0, output * 3), 3, gl.UNSIGNED_BYTE, true);
+    upload(0, positions, 3, gl.FLOAT);
+    upload(1, preparedNormals, 3, gl.FLOAT);
+    upload(2, colors, 3, gl.UNSIGNED_BYTE, true);
+    const indexBuffer = gl.createBuffer();
+    this.buffers.push(indexBuffer);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
     gl.bindVertexArray(null);
-    this.vertexCount = output;
+    this.indexCount = indices.length;
   }
 
-  render(yaw, pitch, zoom) {
+  render(yaw, pitch, zoom, panX = 0, panY = 0) {
     if (!this.available) return;
     const gl = this.gl;
     const bounds = this.canvas.parentElement.getBoundingClientRect();
@@ -2414,7 +2525,7 @@ class MeshRenderer {
     gl.viewport(0, 0, width, height);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (!this.vertexCount) return;
+    if (!this.indexCount) return;
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
     gl.disable(gl.CULL_FACE);
@@ -2423,8 +2534,10 @@ class MeshRenderer {
     gl.uniform1f(this.uniforms.pitch, pitch);
     gl.uniform1f(this.uniforms.zoom, zoom);
     gl.uniform1f(this.uniforms.aspect, width / height);
+    gl.uniform2f(this.uniforms.pan, panX * 2, panY * -2);
+    gl.uniform1f(this.uniforms.surfaceMode, this.surfaceMode);
     gl.bindVertexArray(this.vao);
-    gl.drawArrays(gl.TRIANGLES, 0, this.vertexCount);
+    gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_INT, 0);
     gl.bindVertexArray(null);
   }
 }
@@ -2438,21 +2551,33 @@ class PointViewer {
     this.meshCanvas = options.meshCanvas || null;
     this.meshRenderer = this.meshCanvas ? new MeshRenderer(this.meshCanvas) : null;
     this.styleButtons = options.styleButtons || [];
+    this.navigationButtons = options.navigationButtons || [];
+    this.scaleElement = options.scaleElement || null;
+    this.scaleBar = options.scaleBar || null;
+    this.scaleValue = options.scaleValue || null;
+    this.boundsValue = options.boundsValue || null;
     this.defaultStyle = options.defaultStyle || "points";
     this.loadingLabel = options.loadingLabel || "正在载入模型预览…";
     this.style = "points";
+    this.navigationMode = "rotate";
     this.positions = null;
     this.colors = null;
+    this.modelExtent = null;
+    this.modelDimensions = null;
     this.meshAvailable = false;
     this.yaw = -0.55;
     this.pitch = -0.28;
     this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
     this.dragging = false;
+    this.dragMode = null;
     this.lastX = 0;
     this.lastY = 0;
     this.loadToken = 0;
     this.bind();
     this.updateStyleControls();
+    this.updateNavigationControls();
     new ResizeObserver(() => this.render()).observe(canvas.parentElement);
   }
 
@@ -2460,54 +2585,105 @@ class PointViewer {
     const surfaces = [this.canvas, this.meshCanvas].filter(Boolean);
     for (const surface of surfaces) {
       surface.addEventListener("pointerdown", (event) => {
+        if (![0, 1, 2].includes(event.button)) return;
+        event.preventDefault();
         this.dragging = true;
+        this.dragMode = (
+          this.navigationMode === "pan"
+          || event.shiftKey
+          || event.button === 1
+          || event.button === 2
+        ) ? "pan" : "rotate";
         this.lastX = event.clientX;
         this.lastY = event.clientY;
         surface.setPointerCapture(event.pointerId);
       });
       surface.addEventListener("pointermove", (event) => {
         if (!this.dragging) return;
-        this.yaw = wrapRadians(this.yaw + (event.clientX - this.lastX) * 0.009);
-        this.pitch = wrapRadians(this.pitch + (event.clientY - this.lastY) * 0.009);
+        const deltaX = event.clientX - this.lastX;
+        const deltaY = event.clientY - this.lastY;
+        if (this.dragMode === "pan") {
+          const bounds = surface.getBoundingClientRect();
+          this.panX = Math.max(-1.5, Math.min(1.5, this.panX + deltaX / Math.max(1, bounds.width)));
+          this.panY = Math.max(-1.5, Math.min(1.5, this.panY + deltaY / Math.max(1, bounds.height)));
+        } else {
+          this.yaw = wrapRadians(this.yaw + deltaX * 0.009);
+          this.pitch = wrapRadians(this.pitch + deltaY * 0.009);
+        }
         this.lastX = event.clientX;
         this.lastY = event.clientY;
         this.render();
       });
-      surface.addEventListener("pointerup", () => { this.dragging = false; });
-      surface.addEventListener("pointercancel", () => { this.dragging = false; });
+      const finishDrag = () => {
+        this.dragging = false;
+        this.dragMode = null;
+      };
+      surface.addEventListener("pointerup", finishDrag);
+      surface.addEventListener("pointercancel", finishDrag);
+      surface.addEventListener("lostpointercapture", finishDrag);
+      surface.addEventListener("contextmenu", (event) => event.preventDefault());
       surface.addEventListener("wheel", (event) => {
         event.preventDefault();
         this.zoom = Math.max(0.35, Math.min(5, this.zoom * Math.exp(-event.deltaY * 0.001)));
         this.render();
       }, { passive: false });
-      surface.addEventListener("dblclick", () => {
-        this.yaw = -0.55;
-        this.pitch = -0.28;
-        this.zoom = 1;
-        this.render();
-      });
     }
     for (const button of this.styleButtons) {
       button.addEventListener("click", () => this.setStyle(button.dataset.viewerStyle));
     }
+    for (const button of this.navigationButtons) {
+      button.addEventListener("click", () => {
+        const action = button.dataset.viewerNavigation;
+        if (action === "reset") this.resetView();
+        else this.setNavigationMode(action);
+      });
+    }
+  }
+
+  setNavigationMode(mode) {
+    this.navigationMode = mode === "pan" ? "pan" : "rotate";
+    for (const surface of [this.canvas, this.meshCanvas].filter(Boolean)) {
+      surface.classList.toggle("viewer-pan-mode", this.navigationMode === "pan");
+    }
+    this.updateNavigationControls();
+  }
+
+  updateNavigationControls() {
+    for (const button of this.navigationButtons) {
+      const action = button.dataset.viewerNavigation;
+      if (action !== "reset") {
+        button.setAttribute("aria-pressed", String(action === this.navigationMode));
+      }
+    }
+  }
+
+  resetView() {
+    this.yaw = -0.55;
+    this.pitch = -0.28;
+    this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.render();
   }
 
   updateStyleControls() {
     for (const button of this.styleButtons) {
-      const meshButton = button.dataset.viewerStyle === "mesh";
-      button.disabled = meshButton && !this.meshAvailable;
+      const needsMesh = ["mesh", "solid"].includes(button.dataset.viewerStyle);
+      button.disabled = needsMesh && !this.meshAvailable;
       button.setAttribute("aria-pressed", String(button.dataset.viewerStyle === this.style));
-      if (meshButton && this.meshRenderer && !this.meshRenderer.available) {
+      if (needsMesh && this.meshRenderer && !this.meshRenderer.available) {
         button.title = this.meshRenderer.error || "WebGL 2 不可用";
       }
     }
   }
 
   setStyle(style) {
-    if (style === "mesh" && !this.meshAvailable) return;
-    this.style = style === "mesh" ? "mesh" : "points";
+    const requested = ["mesh", "solid"].includes(style) ? style : "points";
+    if (requested !== "points" && !this.meshAvailable) return;
+    this.style = requested;
     this.canvas.hidden = this.style !== "points";
-    if (this.meshCanvas) this.meshCanvas.hidden = this.style !== "mesh";
+    if (this.meshCanvas) this.meshCanvas.hidden = this.style === "points";
+    if (this.meshRenderer) this.meshRenderer.setSurfaceMode(this.style);
     this.updateStyleControls();
     this.render();
   }
@@ -2517,6 +2693,9 @@ class PointViewer {
     this.message.hidden = false;
     this.message.textContent = this.loadingLabel;
     this.positions = null;
+    this.modelExtent = null;
+    this.modelDimensions = null;
+    if (this.scaleElement) this.scaleElement.hidden = true;
     this.meshAvailable = false;
     if (this.meshRenderer) this.meshRenderer.clear();
     this.setStyle("points");
@@ -2550,6 +2729,9 @@ class PointViewer {
     }
     const extent = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
     if (!Number.isFinite(extent) || extent <= 0) throw new Error("模型顶点范围无效");
+    this.modelExtent = extent;
+    this.modelDimensions = [maxX - minX, maxY - minY, maxZ - minZ];
+    if (this.scaleElement) this.scaleElement.hidden = false;
     const centerX = (minX + maxX) / 2;
     const centerY = (minY + maxY) / 2;
     const centerZ = (minZ + maxZ) / 2;
@@ -2576,23 +2758,58 @@ class PointViewer {
     ) {
       this.meshRenderer.setModel(
         normalize(model.meshPositions),
+        model.meshNormals,
         model.meshColors,
         model.indices,
       );
       this.meshAvailable = true;
-      const meshButton = this.styleButtons.find((button) => button.dataset.viewerStyle === "mesh");
-      if (meshButton) meshButton.title = `${model.faceCount.toLocaleString()} 个三角面`;
+      for (const button of this.styleButtons) {
+        if (["mesh", "solid"].includes(button.dataset.viewerStyle)) {
+          button.title = `${model.faceCount.toLocaleString()} 个三角面 · 高清索引渲染`;
+        }
+      }
     }
     this.yaw = -0.55;
     this.pitch = -0.28;
     this.zoom = 1;
+    this.panX = 0;
+    this.panY = 0;
     this.setStyle(this.defaultStyle === "mesh" && this.meshAvailable ? "mesh" : "points");
+  }
+
+  updateScale() {
+    if (!this.scaleElement || !this.scaleBar || !this.scaleValue || !this.boundsValue) return;
+    if (!Number.isFinite(this.modelExtent) || this.modelExtent <= 0 || !this.modelDimensions) {
+      this.scaleElement.hidden = true;
+      return;
+    }
+    const bounds = this.canvas.parentElement.getBoundingClientRect();
+    const referencePixels = Math.min(bounds.width, bounds.height);
+    const pixelsPerMeter = (
+      referencePixels * 1.55 * this.zoom / (2.35 * this.modelExtent)
+    );
+    const targetPixels = Math.max(72, Math.min(120, bounds.width * 0.14));
+    const scaleMeters = niceScaleLength(targetPixels / pixelsPerMeter);
+    if (!scaleMeters || !Number.isFinite(pixelsPerMeter) || pixelsPerMeter <= 0) {
+      this.scaleElement.hidden = true;
+      return;
+    }
+    const label = formatSceneLength(scaleMeters);
+    const dimensions = formatSceneDimensions(this.modelDimensions);
+    this.scaleBar.style.width = `${Math.max(1, Math.round(scaleMeters * pixelsPerMeter))}px`;
+    this.scaleValue.textContent = label;
+    this.boundsValue.textContent = dimensions;
+    const description = `中心平面比例尺 ${label}；模型包围盒 ${dimensions}`;
+    this.scaleElement.setAttribute("aria-label", description);
+    this.scaleElement.title = `${description}。透视视图中，前后位置的屏幕比例会略有不同。`;
+    this.scaleElement.hidden = false;
   }
 
   render() {
     this.orientation.render(this.yaw, this.pitch);
-    if (this.style === "mesh" && this.meshAvailable) {
-      this.meshRenderer.render(this.yaw, this.pitch, this.zoom);
+    this.updateScale();
+    if (this.style !== "points" && this.meshAvailable) {
+      this.meshRenderer.render(this.yaw, this.pitch, this.zoom, this.panX, this.panY);
       return;
     }
     const bounds = this.canvas.parentElement.getBoundingClientRect();
@@ -2610,7 +2827,8 @@ class PointViewer {
     const cosY = Math.cos(this.yaw), sinY = Math.sin(this.yaw);
     const cosP = Math.cos(this.pitch), sinP = Math.sin(this.pitch);
     const focal = Math.min(width, height) * 1.55 * this.zoom;
-    const centerX = width / 2, centerY = height / 2;
+    const centerX = width * (0.5 + this.panX);
+    const centerY = height * (0.5 + this.panY);
     const pointSize = Math.max(1, dpr * 1.15);
     context.globalAlpha = 0.84;
     for (let index = 0; index < this.positions.length; index += 3) {
@@ -2655,8 +2873,13 @@ const modelViewer = new PointViewer(
   {
     meshCanvas: elements.meshViewer,
     styleButtons: elements.viewerStyleButtons,
+    navigationButtons: elements.viewerNavigationButtons,
+    scaleElement: elements.viewerScale,
+    scaleBar: elements.viewerScaleBar,
+    scaleValue: elements.viewerScaleValue,
+    boundsValue: elements.viewerBounds,
     defaultStyle: "mesh",
-    loadingLabel: "正在准备轻量网格预览，首次加载可能稍久…",
+    loadingLabel: "正在准备高清网格预览，首次加载可能稍久…",
   },
 );
 
