@@ -384,6 +384,80 @@ class WebRecordingManagementTests(unittest.TestCase):
             self.controller.delete_managed_recording("not-a-video.txt")
 
 
+class WebPointCloudTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = ControlCenter(ROOT / "open3d-reconstruct")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="open3d-point-cloud-picker-test-"
+        )
+
+    def tearDown(self) -> None:
+        self.controller.close()
+        self.temporary.cleanup()
+
+    @staticmethod
+    def write_ply(path: Path) -> Path:
+        path.write_text(
+            "ply\nformat ascii 1.0\n"
+            "element vertex 3\n"
+            "property float x\nproperty float y\nproperty float z\n"
+            "end_header\n"
+            "0 0 0\n1 0 0\n0 1 0\n",
+            encoding="ascii",
+        )
+        return path
+
+    def test_picker_opens_current_scene_and_filters_to_ply(self) -> None:
+        scene = Path(self.temporary.name) / "dataset" / "scene"
+        scene.mkdir(parents=True)
+        source = self.write_ply(scene / "other.PLY")
+        with self.controller._lock:
+            self.controller._mesh = scene / "integrated.ply"
+        completed = subprocess.CompletedProcess(
+            args=["zenity"], returncode=0, stdout=f"{source}\n", stderr=""
+        )
+        with (
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/usr/bin/zenity",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            state = self.controller.choose_local_point_cloud()
+
+        self.assertIsNotNone(state)
+        assert state is not None
+        arguments = run.call_args.args[0]
+        self.assertIn(f"--filename={scene.resolve()}{os.sep}", arguments)
+        self.assertIn("--file-filter=PLY 点云与网格 | *.ply *.PLY", arguments)
+        self.assertFalse(any("所有文件" in argument for argument in arguments))
+        self.assertEqual(self.controller.result_file("point-cloud"), source.resolve())
+        self.assertEqual(
+            state["loaded_point_cloud_url"], "/api/files/point-cloud"
+        )
+        self.assertEqual(len(list(scene.glob("other*"))), 1)
+
+        cleared = self.controller.clear_local_point_cloud()
+        self.assertIsNone(cleared["loaded_point_cloud"])
+        self.assertTrue(source.is_file())
+
+    def test_suffix_and_ply_signature_are_both_validated(self) -> None:
+        wrong_suffix = Path(self.temporary.name) / "cloud.pcd"
+        wrong_suffix.write_bytes(b"ply\n")
+        with self.assertRaises(WebActionError) as suffix_error:
+            self.controller.select_local_point_cloud(wrong_suffix)
+        self.assertEqual(suffix_error.exception.status, 415)
+
+        wrong_content = Path(self.temporary.name) / "cloud.ply"
+        wrong_content.write_bytes(b"not a point cloud")
+        with self.assertRaises(WebActionError) as content_error:
+            self.controller.select_local_point_cloud(wrong_content)
+        self.assertEqual(content_error.exception.status, 415)
+
+
 class ControlCenterProcessTests(unittest.TestCase):
     def setUp(self) -> None:
         (ROOT / ".cache").mkdir(exist_ok=True)
@@ -561,6 +635,7 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn("连接并录制".encode(), page)
         self.assertIn("结束录制".encode(), page)
         self.assertIn("打开本地录制".encode(), page)
+        self.assertIn("加载其他点云".encode(), page)
         self.assertIn("管理录制".encode(), page)
         self.assertIn("视频及全部产物".encode(), page)
         self.assertNotIn(b'id="recording-file"', page)
@@ -614,6 +689,8 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"this.modelExtent", script)
         self.assertIn(b"mesh_preview_url", script)
         self.assertIn(b"/api/recording/select-local", script)
+        self.assertIn(b"/api/point-cloud/select-local", script)
+        self.assertIn(b"fallbackToPoints", script)
         self.assertIn(b"/api/recordings/delete", script)
         self.assertNotIn(b"function uploadRecording", script)
         self.assertIn(b"wrapRadians(this.pitch", script)
@@ -629,12 +706,32 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b".viewer-scale-bar", style)
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
 
+    def test_selected_point_cloud_can_be_streamed_and_cleared(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="web-point-cloud-test-"
+        ) as temporary:
+            source = WebPointCloudTests.write_ply(Path(temporary) / "cloud.ply")
+            state = self.controller.select_local_point_cloud(source)
+            self.assertEqual(
+                state["loaded_point_cloud_url"], "/api/files/point-cloud"
+            )
+
+            payload, headers = self.get("/api/files/point-cloud")
+            self.assertEqual(payload, source.read_bytes())
+            self.assertEqual(headers["Content-Type"], "model/ply")
+
+            cleared = self.post_json("/api/point-cloud/clear", {})
+            self.assertIsNone(cleared["state"]["loaded_point_cloud"])
+            self.assertTrue(source.is_file())
+
     def test_state_api_starts_idle(self) -> None:
         payload, _ = self.get("/api/state")
         value = json.loads(payload)
         self.assertTrue(value["ok"])
         self.assertEqual(value["state"]["phase"], "idle")
         self.assertTrue(value["state"]["can_import_recording"])
+        self.assertTrue(value["state"]["can_select_point_cloud"])
+        self.assertIsNone(value["state"]["loaded_point_cloud"])
         self.assertEqual(value["state"]["logs"], [])
         self.assertIsNone(value["state"]["live"])
         self.assertIsNone(value["state"]["conversion"])

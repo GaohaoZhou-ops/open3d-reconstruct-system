@@ -19,6 +19,8 @@ const elements = {
   openRecording: $("#open-recording"),
   openRecordingLabel: $("#open-recording-label"),
   manageRecordings: $("#manage-recordings"),
+  openPointCloud: $("#open-point-cloud"),
+  openPointCloudLabel: $("#open-point-cloud-label"),
   startConversion: $("#start-conversion"),
   phaseBadge: $("#phase-badge"),
   taskSummary: $("#task-summary"),
@@ -85,9 +87,11 @@ const elements = {
   processViewerOrientation: $("#process-viewer-orientation"),
   processModelLabel: $("#process-model-label"),
   resultPanel: $("#result-panel"),
+  resultSourceLabel: $("#result-source-label"),
   resultName: $("#result-name"),
   resultSize: $("#result-size"),
   downloadMesh: $("#download-mesh"),
+  closeLoadedPointCloud: $("#close-loaded-point-cloud"),
   downloadRecording: $("#download-recording"),
   viewer: $("#model-viewer"),
   meshViewer: $("#model-mesh-viewer"),
@@ -986,6 +990,7 @@ function updateControls() {
     can_import_recording: true,
     can_stop_recording: false,
     can_start_conversion: false,
+    can_select_point_cloud: true,
     task: null,
   };
   const selected = Boolean(app.selectedHardware);
@@ -995,6 +1000,7 @@ function updateControls() {
   elements.stopRecording.disabled = !state.can_stop_recording || app.requestBusy;
   elements.openRecording.disabled = !state.can_import_recording || app.requestBusy;
   elements.manageRecordings.disabled = app.requestBusy;
+  elements.openPointCloud.disabled = state.can_select_point_cloud === false || locked;
   elements.startConversion.disabled = !state.can_start_conversion || app.requestBusy;
   elements.deviceIndex.disabled = !selected || locked;
   elements.recordingName.disabled = !selected || locked;
@@ -1265,7 +1271,14 @@ function renderEmptyStage(state) {
     || state.phase === "stopping"
     || state.phase === "converting"
     || (state.phase === "error" && state.conversion);
-  const resultReady = Boolean(state.mesh_url && state.mesh && state.mesh.exists);
+  const resultReady = Boolean(
+    (state.mesh_url && state.mesh && state.mesh.exists)
+    || (
+      state.loaded_point_cloud_url
+      && state.loaded_point_cloud
+      && state.loaded_point_cloud.exists
+    )
+  );
   elements.emptyStage.hidden = processActive || resultReady;
   if (elements.emptyStage.hidden) return;
 
@@ -1349,6 +1362,13 @@ function renderState(state) {
       } else {
         setSummary("", "选择相机或打开录制", "可实时录制，也可零拷贝引用本机 MKV/BAG");
       }
+  }
+  if (state.loaded_point_cloud_url && !state.task) {
+    setSummary(
+      "success",
+      "已加载外部点云",
+      `${state.loaded_point_cloud.path} · ${formatBytes(state.loaded_point_cloud.size)}`,
+    );
   }
 
   renderLogs(state);
@@ -1647,6 +1667,30 @@ async function chooseLocalRecording() {
   if (selectedState?.phase === "recorded") openReconstructionDialog();
 }
 
+async function chooseLocalPointCloud() {
+  if (app.requestBusy) return;
+  app.requestBusy = true;
+  elements.errorBanner.hidden = true;
+  elements.openPointCloudLabel.textContent = "等待本机选择…";
+  setSummary(
+    "running",
+    "请选择 PLY 点云",
+    "文件窗口已定位到当前重建结果目录，只会显示 .ply 文件",
+  );
+  updateControls();
+  try {
+    const payload = await post("/api/point-cloud/select-local");
+    if (!payload.cancelled) renderState(payload.state);
+  } catch (error) {
+    elements.errorBanner.hidden = false;
+    elements.errorBanner.textContent = error.message;
+  } finally {
+    app.requestBusy = false;
+    elements.openPointCloudLabel.textContent = "加载其他点云";
+    updateControls();
+  }
+}
+
 elements.hardwareInputs.forEach((input) => {
   input.addEventListener("change", () => selectHardware(input.value));
 });
@@ -1665,6 +1709,10 @@ elements.cameraParametersDialog.addEventListener("click", (event) => {
 });
 
 elements.refreshDevices.addEventListener("click", () => fetchDevices(true));
+elements.openPointCloud.addEventListener("click", chooseLocalPointCloud);
+elements.closeLoadedPointCloud.addEventListener("click", () => {
+  runAction(() => post("/api/point-cloud/clear"));
+});
 
 elements.startRecording.addEventListener("click", () => runAction(() => post("/api/record/start", {
   hardware: app.selectedHardware,
@@ -1740,22 +1788,39 @@ elements.copyLog.addEventListener("click", async () => {
 });
 
 function renderResult(state) {
-  const ready = Boolean(state.mesh_url && state.mesh && state.mesh.exists);
+  const externalReady = Boolean(
+    state.loaded_point_cloud_url
+    && state.loaded_point_cloud
+    && state.loaded_point_cloud.exists
+  );
+  const meshReady = Boolean(state.mesh_url && state.mesh && state.mesh.exists);
+  const ready = externalReady || meshReady;
   elements.resultPanel.hidden = !ready;
   if (!ready) {
     app.loadedMeshKey = null;
     return;
   }
-  elements.resultName.textContent = basename(state.mesh.path);
-  elements.resultSize.textContent = formatBytes(state.mesh.size);
-  elements.downloadMesh.href = state.mesh_url;
+  const model = externalReady ? state.loaded_point_cloud : state.mesh;
+  const modelUrl = externalReady ? state.loaded_point_cloud_url : state.mesh_url;
+  elements.resultSourceLabel.textContent = externalReady ? "本地" : "完成";
+  elements.resultName.textContent = basename(model.path);
+  elements.resultSize.textContent = formatBytes(model.size);
+  elements.downloadMesh.href = modelUrl;
+  elements.closeLoadedPointCloud.hidden = !externalReady;
+  elements.closeLoadedPointCloud.textContent = meshReady ? "返回重建结果" : "关闭预览";
   elements.downloadRecording.href = state.recording_url || "#";
-  elements.downloadRecording.hidden = !state.recording_url;
-  const key = `${state.mesh.path}:${state.mesh.size}`;
+  elements.downloadRecording.hidden = externalReady || !state.recording_url;
+  const sourceKind = externalReady ? "external" : "reconstruction";
+  const key = `${sourceKind}:${model.path}:${model.size}`;
   if (app.loadedMeshKey !== key) {
     app.loadedMeshKey = key;
-    const previewUrl = state.mesh_preview_url || state.mesh_url;
-    modelViewer.load(`${previewUrl}?v=${encodeURIComponent(key)}`);
+    const previewUrl = externalReady
+      ? modelUrl
+      : (state.mesh_preview_url || state.mesh_url);
+    modelViewer.load(
+      `${previewUrl}?v=${encodeURIComponent(key)}`,
+      { fallbackToPoints: externalReady },
+    );
   }
 }
 
@@ -2085,7 +2150,7 @@ function normalizedColor(value, type) {
   return Math.max(0, Math.min(255, Math.round(value)));
 }
 
-function parseBinaryVertices(buffer, info) {
+function parseBinaryVertices(buffer, info, pointsOnly = false) {
   const littleEndian = info.format === "binary_little_endian";
   if (!littleEndian && info.format !== "binary_big_endian") {
     throw new Error(`不支持的 PLY 格式：${info.format}`);
@@ -2106,7 +2171,7 @@ function parseBinaryVertices(buffer, info) {
   const sampledCount = Math.ceil(info.vertexCount / step);
   const positions = new Float32Array(sampledCount * 3);
   const colors = new Uint8Array(sampledCount * 3);
-  const hasFaces = info.faceCount > 0;
+  const hasFaces = info.faceCount > 0 && !pointsOnly;
   const meshPositions = hasFaces ? new Float32Array(info.vertexCount * 3) : null;
   const meshColors = hasFaces ? new Uint8Array(info.vertexCount * 3) : null;
   const hasNormals = Boolean(byName.nx && byName.ny && byName.nz);
@@ -2202,11 +2267,11 @@ function parseBinaryVertices(buffer, info) {
     meshNormals,
     indices,
     sourceCount: info.vertexCount,
-    faceCount: info.faceCount,
+    faceCount: hasFaces ? info.faceCount : 0,
   };
 }
 
-function parseAsciiVertices(buffer, info) {
+function parseAsciiVertices(buffer, info, pointsOnly = false) {
   const text = new TextDecoder("utf-8").decode(new Uint8Array(buffer, info.dataOffset));
   let cursor = 0;
   const nextToken = () => {
@@ -2221,7 +2286,7 @@ function parseAsciiVertices(buffer, info) {
   const sampledCount = Math.ceil(info.vertexCount / step);
   const positions = new Float32Array(sampledCount * 3);
   const colors = new Uint8Array(sampledCount * 3);
-  const hasFaces = info.faceCount > 0;
+  const hasFaces = info.faceCount > 0 && !pointsOnly;
   const meshPositions = hasFaces ? new Float32Array(info.vertexCount * 3) : null;
   const meshColors = hasFaces ? new Uint8Array(info.vertexCount * 3) : null;
   const propertyIndex = Object.fromEntries(info.properties.map((property, index) => [property.name, index]));
@@ -2307,18 +2372,27 @@ function parseAsciiVertices(buffer, info) {
     meshNormals,
     indices,
     sourceCount: info.vertexCount,
-    faceCount: info.faceCount,
+    faceCount: hasFaces ? info.faceCount : 0,
   };
 }
 
-function parsePly(buffer) {
+function parsePly(buffer, options = {}) {
   const bytes = new Uint8Array(buffer);
   if (new TextDecoder("ascii").decode(bytes.subarray(0, 3)) !== "ply") {
     throw new Error("结果文件不是 PLY 格式");
   }
   const info = plyHeaderInfo(bytes);
-  if (info.format === "ascii") return parseAsciiVertices(buffer, info);
-  return parseBinaryVertices(buffer, info);
+  const parser = info.format === "ascii" ? parseAsciiVertices : parseBinaryVertices;
+  const pointsOnly = Boolean(
+    options.pointsOnly
+    || (options.fallbackToPoints && info.faceCount > MAX_MESH_PREVIEW_FACES)
+  );
+  try {
+    return parser(buffer, info, pointsOnly);
+  } catch (error) {
+    if (!options.fallbackToPoints || pointsOnly) throw error;
+    return parser(buffer, info, true);
+  }
 }
 
 class ViewerOrientation {
@@ -2870,7 +2944,7 @@ class PointViewer {
     this.render();
   }
 
-  async load(url) {
+  async load(url, options = {}) {
     const token = ++this.loadToken;
     this.message.hidden = false;
     this.message.textContent = this.loadingLabel;
@@ -2887,7 +2961,7 @@ class PointViewer {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const buffer = await response.arrayBuffer();
       await new Promise((resolve) => setTimeout(resolve, 0));
-      const model = parsePly(buffer);
+      const model = parsePly(buffer, options);
       if (token !== this.loadToken) return;
       this.setModel(model);
       this.message.hidden = true;

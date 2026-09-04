@@ -95,6 +95,7 @@
             <button id="open-recording" class="action import" type="button" title="直接引用 MKV/BAG，不复制视频数据"><i class="open-icon"></i><span id="open-recording-label">打开本地录制</span></button>
             <button id="manage-recordings" class="action manage" type="button" title="管理已经落盘的录制和重建产物"><i class="manage-icon"></i><span>管理录制</span></button>
           </div>
+          <button id="open-point-cloud" class="action point-cloud" type="button" title="仅选择 PLY，默认打开当前数据集的 scene 目录"><i class="point-cloud-icon"></i><span id="open-point-cloud-label">加载其他点云</span></button>
           <button id="start-conversion" class="action convert" type="button" disabled><i class="convert-icon"></i><span>开始重建</span></button>
         </div>
 
@@ -229,13 +230,14 @@
 
       <section id="result-panel" class="panel result-panel" hidden>
         <div class="result-heading">
-          <div><span class="step-label success-label">完成</span><h2>3D 模型预览</h2></div>
+          <div><span id="result-source-label" class="step-label success-label">完成</span><h2>3D 模型预览</h2></div>
           <div class="result-meta">
             <span><small>文件</small><strong id="result-name">integrated.ply</strong></span>
             <span><small>大小</small><strong id="result-size">—</strong></span>
           </div>
           <div class="result-links">
             <a id="download-mesh" class="download-link" href="/api/files/mesh" download>下载 PLY</a>
+            <button id="close-loaded-point-cloud" class="text-link" type="button" hidden>返回重建结果</button>
             <a id="download-recording" class="text-link" href="/api/files/recording">下载原始录制</a>
           </div>
         </div>

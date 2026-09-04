@@ -45,6 +45,7 @@ RECORDING_UPLOAD_CHUNK_BYTES = 4 * 1024**2
 MIN_FREE_STORAGE_BYTES = 256 * 1024**2
 MESH_PREVIEW_TARGET_TRIANGLES = 500_000
 MESH_PREVIEW_CACHE_VERSION = 2
+POINT_CLOUD_SUFFIXES = frozenset({".ply"})
 WEB_MATCH_PREFIX = "__OPEN3D_WEB_MATCH__ "
 PIPELINE_STEPS = (
     ("extract", "提取 RGB-D 帧"),
@@ -525,6 +526,7 @@ class ControlCenter:
         self._recording: Path | None = None
         self._dataset: Path | None = None
         self._mesh: Path | None = None
+        self._loaded_point_cloud: Path | None = None
         self._error: str | None = None
         self._recording_started_at: str | None = None
         self._recording_finished_at: str | None = None
@@ -1114,6 +1116,7 @@ class ControlCenter:
             self._recording = recording
             self._dataset = dataset
             self._mesh = dataset / "scene" / "integrated.ply"
+            self._loaded_point_cloud = None
             self._error = None
             self._recording_started_at = None
             self._recording_finished_at = None
@@ -1279,6 +1282,7 @@ class ControlCenter:
         self._recording = recording.absolute()
         self._dataset = dataset.absolute()
         self._mesh = self._dataset / "scene" / "integrated.ply"
+        self._loaded_point_cloud = None
         self._error = None
         self._recording_started_at = None
         try:
@@ -1443,6 +1447,127 @@ class ControlCenter:
             )
         finally:
             self._file_picker_lock.release()
+
+    def _point_cloud_picker_directory(self) -> Path:
+        with self._lock:
+            mesh = self._mesh
+            dataset = self._dataset
+        candidates = []
+        if mesh is not None:
+            candidates.append(mesh.parent)
+        if dataset is not None:
+            candidates.append(dataset / "scene")
+        candidates.append(DATASETS_DIR)
+        for candidate in candidates:
+            try:
+                if candidate.is_dir():
+                    return candidate.resolve()
+            except OSError:
+                continue
+        DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+        return DATASETS_DIR.resolve()
+
+    @staticmethod
+    def _validated_local_point_cloud(path: object) -> Path:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            raise WebActionError("未选择点云文件", HTTPStatus.BAD_REQUEST)
+        if Path(raw_path).suffix.lower() not in POINT_CLOUD_SUFFIXES:
+            raise WebActionError(
+                "仅支持 .ply 点云文件",
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+        try:
+            source = Path(raw_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WebActionError(
+                f"所选点云文件不存在或不可访问: {exc}",
+                HTTPStatus.BAD_REQUEST,
+            ) from exc
+        if not _is_nonempty_file(source):
+            raise WebActionError("所选点云文件为空或不可读", HTTPStatus.BAD_REQUEST)
+        try:
+            with source.open("rb") as stream:
+                signature = stream.read(4)
+        except OSError as exc:
+            raise WebActionError(
+                f"无法读取所选点云文件: {exc}",
+                HTTPStatus.BAD_REQUEST,
+            ) from exc
+        if signature not in {b"ply\n", b"ply\r"}:
+            raise WebActionError(
+                "文件后缀是 .ply，但文件内容不是有效的 PLY 格式",
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+        return source
+
+    def select_local_point_cloud(self, path: object) -> dict[str, Any]:
+        source = self._validated_local_point_cloud(path)
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+            self._loaded_point_cloud = source
+            self._append_log(
+                "已加载本地点云用于浏览器预览（不会复制原文件）："
+                f"{_display_path(source)}。",
+                level="success",
+            )
+            return self._snapshot_locked()
+
+    def choose_local_point_cloud(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+        if not self._file_picker_lock.acquire(blocking=False):
+            raise WebActionError("本地文件选择窗口已经打开")
+        try:
+            picker = shutil.which("zenity")
+            if picker is None:
+                raise WebActionError(
+                    "系统未安装 zenity，无法打开本机文件选择窗口",
+                    HTTPStatus.NOT_IMPLEMENTED,
+                )
+            initial_directory = self._point_cloud_picker_directory()
+            try:
+                result = subprocess.run(
+                    [
+                        picker,
+                        "--file-selection",
+                        "--title=选择 PLY 点云文件",
+                        f"--filename={initial_directory}{os.sep}",
+                        "--file-filter=PLY 点云与网格 | *.ply *.PLY",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except OSError as exc:
+                raise WebActionError(
+                    f"无法打开本机文件选择窗口: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                ) from exc
+            if result.returncode in {1, 5} or not result.stdout.strip():
+                return None
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"退出代码 {result.returncode}"
+                raise WebActionError(
+                    f"本机文件选择失败: {detail}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            return self.select_local_point_cloud(result.stdout.strip())
+        finally:
+            self._file_picker_lock.release()
+
+    def clear_local_point_cloud(self) -> dict[str, Any]:
+        with self._lock:
+            if self._loaded_point_cloud is not None:
+                self._loaded_point_cloud = None
+                self._append_log("已关闭外部点云预览。", level="success")
+            return self._snapshot_locked()
 
     def select_managed_recording(
         self, name: object, *, hardware: object = None
@@ -1663,6 +1788,7 @@ class ControlCenter:
             self._recording = recording
             self._dataset = dataset
             self._mesh = dataset / "scene" / "integrated.ply"
+            self._loaded_point_cloud = None
             self._error = None
             self._recording_started_at = _now_iso()
             self._recording_finished_at = None
@@ -1785,6 +1911,7 @@ class ControlCenter:
             self._conversion_started_at = _now_iso()
             self._conversion_finished_at = None
             self._mesh = self._dataset / "scene" / "integrated.ply"
+            self._loaded_point_cloud = None
             self._reconstruction_settings = {
                 "stride": stride_value,
                 **parameter_values,
@@ -2038,8 +2165,14 @@ class ControlCenter:
         busy = process is not None or self._task is not None
         recording = _file_summary(self._recording)
         mesh = _file_summary(self._mesh)
+        loaded_point_cloud = _file_summary(self._loaded_point_cloud)
         recording_ready = bool(recording and recording["exists"] and recording["size"] > 0)
         mesh_ready = bool(mesh and mesh["exists"] and mesh["size"] > 0)
+        loaded_point_cloud_ready = bool(
+            loaded_point_cloud
+            and loaded_point_cloud["exists"]
+            and loaded_point_cloud["size"] > 0
+        )
         import_progress: dict[str, Any] | None = None
         if self._task == "import":
             total_bytes = max(0, self._import_expected_bytes)
@@ -2066,6 +2199,7 @@ class ControlCenter:
             "recording": recording,
             "dataset": _display_path(self._dataset),
             "mesh": mesh,
+            "loaded_point_cloud": loaded_point_cloud,
             "recording_started_at": self._recording_started_at,
             "recording_finished_at": self._recording_finished_at,
             "conversion_started_at": self._conversion_started_at,
@@ -2076,9 +2210,13 @@ class ControlCenter:
             "can_import_recording": not busy,
             "can_stop_recording": process is not None and self._task == "record" and self._phase == "recording",
             "can_start_conversion": not busy and recording_ready,
+            "can_select_point_cloud": not busy,
             "recording_url": "/api/files/recording" if recording_ready else None,
             "mesh_url": "/api/files/mesh" if mesh_ready else None,
             "mesh_preview_url": "/api/files/mesh-preview" if mesh_ready else None,
+            "loaded_point_cloud_url": (
+                "/api/files/point-cloud" if loaded_point_cloud_ready else None
+            ),
             "live": self._live_snapshot_locked(),
             "conversion": self._process_snapshot_locked(),
             "logs": list(self._logs),
@@ -2129,18 +2267,27 @@ class ControlCenter:
 
     def result_file(self, kind: str) -> Path | None:
         with self._lock:
-            path = self._mesh if kind == "mesh" else self._recording
+            if kind == "mesh":
+                path = self._mesh
+            elif kind == "recording":
+                path = self._recording
+            elif kind == "point-cloud":
+                path = self._loaded_point_cloud
+            else:
+                return None
             if not _is_nonempty_file(path):
                 return None
             assert path is not None
             try:
                 if kind == "mesh":
                     path.resolve().relative_to(ROOT.resolve())
-                else:
+                elif kind == "recording":
                     path.absolute().relative_to(RECORDINGS_DIR.resolve())
+                elif path.suffix.lower() not in POINT_CLOUD_SUFFIXES:
+                    return None
             except ValueError:
                 return None
-            return path.resolve() if kind == "mesh" else path.absolute()
+            return path.absolute() if kind == "recording" else path.resolve()
 
     def mesh_preview_file(self) -> Path | None:
         """Return a cached browser-sized triangle mesh without changing the result."""
@@ -2535,15 +2682,12 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
             if path is None:
                 self._error(HTTPStatus.NOT_FOUND, "文件尚未生成或已不存在")
                 return
-            content_type = (
-                "model/ply"
-                if kind in {"mesh", "mesh-preview"}
-                else "application/octet-stream"
-            )
+            inline_kinds = {"mesh", "mesh-preview", "point-cloud"}
+            content_type = "model/ply" if kind in inline_kinds else "application/octet-stream"
             size = path.stat().st_size
             self.send_response(HTTPStatus.OK)
             self._headers(content_type, size, cache="no-store")
-            disposition = "inline" if kind in {"mesh", "mesh-preview"} else "attachment"
+            disposition = "inline" if kind in inline_kinds else "attachment"
             self.send_header(
                 "Content-Disposition",
                 f"{disposition}; filename*=UTF-8''{quote(path.name)}",
@@ -2689,6 +2833,8 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 self._send_file("mesh")
             elif parsed.path == "/api/files/mesh-preview":
                 self._send_file("mesh-preview")
+            elif parsed.path == "/api/files/point-cloud":
+                self._send_file("point-cloud")
             else:
                 self._error(HTTPStatus.NOT_FOUND, "页面不存在")
 
@@ -2713,6 +2859,21 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                             "cancelled": selected is None,
                             "state": selected or controller.snapshot(),
                         }
+                    )
+                    return
+                if parsed.path == "/api/point-cloud/select-local":
+                    selected = controller.choose_local_point_cloud()
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "cancelled": selected is None,
+                            "state": selected or controller.snapshot(),
+                        }
+                    )
+                    return
+                if parsed.path == "/api/point-cloud/clear":
+                    self._send_json(
+                        {"ok": True, "state": controller.clear_local_point_cloud()}
                     )
                     return
                 if parsed.path == "/api/recordings/use":
