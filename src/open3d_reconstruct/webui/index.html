@@ -33,24 +33,39 @@
         </div>
 
         <fieldset class="camera-grid" aria-label="相机硬件">
-          <label class="camera-card" data-hardware="azure-kinect">
-            <input type="radio" name="hardware" value="azure-kinect">
-            <span class="camera-code">K4A</span>
-            <span class="camera-copy"><strong>Azure Kinect DK</strong><small>RGB · Depth · IMU</small></span>
-            <span class="device-state checking" data-device-state="azure-kinect">检测中</span>
-          </label>
-          <label class="camera-card" data-hardware="d435">
-            <input type="radio" name="hardware" value="d435">
-            <span class="camera-code">RS</span>
-            <span class="camera-copy"><strong>RealSense D435</strong><small>RGB · Depth</small></span>
-            <span class="device-state checking" data-device-state="d435">检测中</span>
-          </label>
-          <label class="camera-card" data-hardware="d435i">
-            <input type="radio" name="hardware" value="d435i">
-            <span class="camera-code">RS+</span>
-            <span class="camera-copy"><strong>RealSense D435i</strong><small>RGB · Depth</small></span>
-            <span class="device-state checking" data-device-state="d435i">检测中</span>
-          </label>
+          <div class="camera-card" data-hardware="azure-kinect">
+            <label class="camera-card-select">
+              <input type="radio" name="hardware" value="azure-kinect">
+              <span class="camera-code">K4A</span>
+              <span class="camera-copy"><strong>Azure Kinect DK</strong><small>RGB · Depth · IMU</small></span>
+            </label>
+            <span class="camera-card-actions">
+              <span class="device-state checking" data-device-state="azure-kinect">检测中</span>
+              <button type="button" data-camera-parameters="azure-kinect" aria-label="查看 Azure Kinect DK 相机参数">查看参数</button>
+            </span>
+          </div>
+          <div class="camera-card" data-hardware="d435">
+            <label class="camera-card-select">
+              <input type="radio" name="hardware" value="d435">
+              <span class="camera-code">RS</span>
+              <span class="camera-copy"><strong>RealSense D435</strong><small>RGB · Depth</small></span>
+            </label>
+            <span class="camera-card-actions">
+              <span class="device-state checking" data-device-state="d435">检测中</span>
+              <button type="button" data-camera-parameters="d435" aria-label="查看 RealSense D435 相机参数">查看参数</button>
+            </span>
+          </div>
+          <div class="camera-card" data-hardware="d435i">
+            <label class="camera-card-select">
+              <input type="radio" name="hardware" value="d435i">
+              <span class="camera-code">RS+</span>
+              <span class="camera-copy"><strong>RealSense D435i</strong><small>RGB · Depth</small></span>
+            </label>
+            <span class="camera-card-actions">
+              <span class="device-state checking" data-device-state="d435i">检测中</span>
+              <button type="button" data-camera-parameters="d435i" aria-label="查看 RealSense D435i 相机参数">查看参数</button>
+            </span>
+          </div>
         </fieldset>
 
         <label class="field device-field">
@@ -280,6 +295,22 @@
     </div>
   </dialog>
 
+  <dialog id="camera-parameters-dialog" class="camera-parameters-dialog" aria-labelledby="camera-parameters-title">
+    <div class="camera-parameters-shell">
+      <header class="dialog-heading">
+        <div><span class="section-number">CAM</span><div><h2 id="camera-parameters-title">相机参数</h2><p id="camera-parameters-subtitle">当前 Web 录制配置与已检测设备信息。</p></div></div>
+        <button id="close-camera-parameters" class="dialog-close" type="button" aria-label="关闭">×</button>
+      </header>
+      <section id="camera-device-summary" class="camera-device-summary" aria-live="polite"></section>
+      <div id="camera-parameters-list" class="camera-parameters-list"></div>
+      <div class="camera-config-source"><span>配置来源</span><code id="camera-parameters-source">—</code></div>
+      <div id="camera-parameters-notes" class="camera-parameters-notes"></div>
+      <footer class="dialog-actions">
+        <button id="dismiss-camera-parameters" class="dialog-secondary" type="button">关闭</button>
+      </footer>
+    </div>
+  </dialog>
+
   <dialog id="delete-recording-dialog" class="delete-recording-dialog" aria-labelledby="delete-recording-title">
     <div class="delete-recording-shell">
       <header class="dialog-heading">
@@ -320,7 +351,7 @@
           </select>
         </label>
         <label class="field">
-          <span>体素尺寸 <small>越小细节越多</small></span>
+          <span>配准体素 <small>越小匹配越精细</small></span>
           <select id="reconstruction-voxel">
             <option value="0.08">8 cm · 快速</option>
             <option value="0.05" selected>5 cm · 均衡</option>
@@ -350,6 +381,15 @@
         <summary>高级参数</summary>
         <div class="parameter-grid">
           <label class="field">
+            <span>最小深度 <small>过滤近距离噪声</small></span>
+            <select id="reconstruction-depth-min">
+              <option value="0.1">0.10 m · 保留近景</option>
+              <option value="0.2">0.20 m</option>
+              <option value="0.3" selected>0.30 m · 默认</option>
+              <option value="0.5">0.50 m · 强过滤</option>
+            </select>
+          </label>
+          <label class="field">
             <span>每片段帧数 <small>越大单片段越慢</small></span>
             <select id="reconstruction-fragment-size">
               <option value="60">60</option>
@@ -369,24 +409,61 @@
           <label class="field">
             <span>精细配准方法</span>
             <select id="reconstruction-icp">
+              <option value="point_to_point">点到点 · 兼容性优先</option>
               <option value="point_to_plane">点到平面 · 较快</option>
               <option value="color" selected>彩色 ICP · 细节更好</option>
+              <option value="generalized">广义 ICP · 更鲁棒但较慢</option>
             </select>
           </label>
           <label class="field">
-            <span>深度差阈值</span>
+            <span>深度差阈值 <small>匹配对应点门限</small></span>
             <select id="reconstruction-depth-diff">
               <option value="0.05">0.05 m · 严格</option>
               <option value="0.07" selected>0.07 m · 默认</option>
               <option value="0.1">0.10 m · 宽松</option>
             </select>
           </label>
+          <label class="field">
+            <span>TSDF 融合体素 <small>越小模型越细、内存越高</small></span>
+            <select id="reconstruction-tsdf-cubic-size">
+              <option value="5.12">10 mm · 快速</option>
+              <option value="3" selected>5.9 mm · 默认</option>
+              <option value="2.048">4 mm · 精细</option>
+              <option value="1.536">3 mm · 很慢</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>SDF 截断距离 <small>越小边缘更锐利</small></span>
+            <select id="reconstruction-sdf-trunc">
+              <option value="0.02">0.02 m · 锐利</option>
+              <option value="0.04" selected>0.04 m · 默认</option>
+              <option value="0.05">0.05 m · 平滑</option>
+              <option value="0.06">0.06 m · 更平滑</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>片内回环偏好 <small>抑制或保留 RGB-D 回环</small></span>
+            <select id="reconstruction-loop-odometry">
+              <option value="0.05">0.05 · 保守</option>
+              <option value="0.1" selected>0.10 · 默认</option>
+              <option value="0.2">0.20 · 积极</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>片段回环偏好 <small>影响全局闭环约束权重</small></span>
+            <select id="reconstruction-loop-registration">
+              <option value="1">1 · 保守</option>
+              <option value="5" selected>5 · 默认</option>
+              <option value="10">10 · 积极</option>
+            </select>
+          </label>
         </div>
+        <p class="advanced-note">配准体素用于降采样与特征匹配；TSDF 融合体素决定最终表面分辨率，两者不是同一个参数。回环偏好越高越信任闭环，也越可能放大错误匹配。</p>
       </details>
 
       <div class="quality-summary">
         <span id="quality-indicator" class="quality-indicator balanced">均衡</span>
-        <div><strong id="quality-summary-title">推荐设置</strong><small id="quality-summary-detail">每 2 帧取 1 帧 · 5 cm 体素 · 彩色 ICP · RANSAC</small></div>
+        <div><strong id="quality-summary-title">推荐设置</strong><small id="quality-summary-detail">每 2 帧取 1 帧 · 5 cm 配准 · 5.9 mm 融合 · 彩色 ICP</small></div>
       </div>
       <p class="dialog-note">实际耗时取决于录制帧数、场景复杂度与 CPU 性能。IMU 仅用于实时姿态展示，不参与经典 RGB-D 重建。</p>
       <footer class="dialog-actions">

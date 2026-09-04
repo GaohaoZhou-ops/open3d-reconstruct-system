@@ -162,7 +162,7 @@ def integrate_rgb_frames_for_fragment(color_files, depth_files, fragment_id,
     pose_graph = o3d.io.read_pose_graph(pose_graph_name)
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=config["tsdf_cubic_size"] / 512.0,
-        sdf_trunc=0.04,
+        sdf_trunc=config["sdf_trunc"],
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
     for i in range(len(pose_graph.nodes)):
         i_abs = fragment_id * config['n_frames_per_fragment'] + i

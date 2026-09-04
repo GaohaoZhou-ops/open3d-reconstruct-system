@@ -7,6 +7,7 @@ const MAX_MESH_PREVIEW_FACES = 600000;
 const elements = {
   cameraCards: $$(".camera-card"),
   hardwareInputs: $$("input[name='hardware']"),
+  cameraParameterButtons: $$('[data-camera-parameters]'),
   refreshDevices: $("#refresh-devices"),
   deviceHint: $("#device-hint"),
   sessionPanel: $("#session-panel"),
@@ -98,6 +99,15 @@ const elements = {
   viewerScaleBar: $("#model-viewer-scale-bar"),
   viewerScaleValue: $("#model-viewer-scale-value"),
   viewerBounds: $("#model-viewer-bounds"),
+  cameraParametersDialog: $("#camera-parameters-dialog"),
+  cameraParametersTitle: $("#camera-parameters-title"),
+  cameraParametersSubtitle: $("#camera-parameters-subtitle"),
+  cameraDeviceSummary: $("#camera-device-summary"),
+  cameraParametersList: $("#camera-parameters-list"),
+  cameraParametersSource: $("#camera-parameters-source"),
+  cameraParametersNotes: $("#camera-parameters-notes"),
+  closeCameraParameters: $("#close-camera-parameters"),
+  dismissCameraParameters: $("#dismiss-camera-parameters"),
   recordingManagerDialog: $("#recording-manager-dialog"),
   closeRecordingManager: $("#close-recording-manager"),
   refreshRecordings: $("#refresh-recordings"),
@@ -119,12 +129,17 @@ const elements = {
   cancelReconstruction: $("#cancel-reconstruction"),
   reconstructionPresets: $$('[data-reconstruction-preset]'),
   reconstructionVoxel: $("#reconstruction-voxel"),
+  reconstructionDepthMin: $("#reconstruction-depth-min"),
   reconstructionDepthMax: $("#reconstruction-depth-max"),
   reconstructionGlobal: $("#reconstruction-global"),
   reconstructionFragmentSize: $("#reconstruction-fragment-size"),
   reconstructionKeyframeInterval: $("#reconstruction-keyframe-interval"),
   reconstructionIcp: $("#reconstruction-icp"),
   reconstructionDepthDiff: $("#reconstruction-depth-diff"),
+  reconstructionTsdfCubicSize: $("#reconstruction-tsdf-cubic-size"),
+  reconstructionSdfTrunc: $("#reconstruction-sdf-trunc"),
+  reconstructionLoopOdometry: $("#reconstruction-loop-odometry"),
+  reconstructionLoopRegistration: $("#reconstruction-loop-registration"),
   qualityIndicator: $("#quality-indicator"),
   qualitySummaryTitle: $("#quality-summary-title"),
   qualitySummaryDetail: $("#quality-summary-detail"),
@@ -164,34 +179,49 @@ const reconstructionPresets = {
     label: "速度优先",
     stride: "4",
     voxel: "0.08",
+    depthMin: "0.3",
     depthMax: "3",
     global: "fgr",
     fragmentSize: "60",
     keyframeInterval: "10",
     icp: "point_to_plane",
     depthDiff: "0.07",
+    tsdfCubicSize: "5.12",
+    sdfTrunc: "0.05",
+    loopOdometry: "0.1",
+    loopRegistration: "5",
   },
   balanced: {
     label: "均衡",
     stride: "2",
     voxel: "0.05",
+    depthMin: "0.3",
     depthMax: "3",
     global: "ransac",
     fragmentSize: "100",
     keyframeInterval: "5",
     icp: "color",
     depthDiff: "0.07",
+    tsdfCubicSize: "3",
+    sdfTrunc: "0.04",
+    loopOdometry: "0.1",
+    loopRegistration: "5",
   },
   quality: {
     label: "质量优先",
     stride: "1",
     voxel: "0.03",
+    depthMin: "0.3",
     depthMax: "3",
     global: "ransac",
     fragmentSize: "100",
     keyframeInterval: "3",
     icp: "color",
     depthDiff: "0.05",
+    tsdfCubicSize: "2.048",
+    sdfTrunc: "0.02",
+    loopOdometry: "0.1",
+    loopRegistration: "5",
   },
 };
 
@@ -657,12 +687,17 @@ function reconstructionFormValues() {
   return {
     stride: elements.frameStride.value,
     voxel: elements.reconstructionVoxel.value,
+    depthMin: elements.reconstructionDepthMin.value,
     depthMax: elements.reconstructionDepthMax.value,
     global: elements.reconstructionGlobal.value,
     fragmentSize: elements.reconstructionFragmentSize.value,
     keyframeInterval: elements.reconstructionKeyframeInterval.value,
     icp: elements.reconstructionIcp.value,
     depthDiff: elements.reconstructionDepthDiff.value,
+    tsdfCubicSize: elements.reconstructionTsdfCubicSize.value,
+    sdfTrunc: elements.reconstructionSdfTrunc.value,
+    loopOdometry: elements.reconstructionLoopOdometry.value,
+    loopRegistration: elements.reconstructionLoopRegistration.value,
   };
 }
 
@@ -686,9 +721,18 @@ function updateReconstructionSummary() {
     ? `${indicatorLabel}设置`
     : "自定义重建设置";
   const strideText = values.stride === "1" ? "使用每一帧" : `每 ${values.stride} 帧取 1 帧`;
-  const icpText = values.icp === "color" ? "彩色 ICP" : "点到平面 ICP";
+  const icpText = {
+    point_to_point: "点到点 ICP",
+    point_to_plane: "点到平面 ICP",
+    color: "彩色 ICP",
+    generalized: "广义 ICP",
+  }[values.icp] || values.icp;
+  const fusionMillimeters = Number(values.tsdfCubicSize) / 512 * 1000;
+  const fusionText = fusionMillimeters < 10
+    ? fusionMillimeters.toFixed(1).replace(/\.0$/, "")
+    : fusionMillimeters.toFixed(0);
   elements.qualitySummaryDetail.textContent = (
-    `${strideText} · ${(Number(values.voxel) * 100).toFixed(0)} cm 体素 · ${icpText} · ${values.global.toUpperCase()}`
+    `${strideText} · ${(Number(values.voxel) * 100).toFixed(0)} cm 配准 · ${fusionText} mm 融合 · ${icpText} · ${values.global.toUpperCase()}`
   );
 }
 
@@ -697,12 +741,17 @@ function applyReconstructionPreset(name) {
   if (!preset) return;
   elements.frameStride.value = preset.stride;
   elements.reconstructionVoxel.value = preset.voxel;
+  elements.reconstructionDepthMin.value = preset.depthMin;
   elements.reconstructionDepthMax.value = preset.depthMax;
   elements.reconstructionGlobal.value = preset.global;
   elements.reconstructionFragmentSize.value = preset.fragmentSize;
   elements.reconstructionKeyframeInterval.value = preset.keyframeInterval;
   elements.reconstructionIcp.value = preset.icp;
   elements.reconstructionDepthDiff.value = preset.depthDiff;
+  elements.reconstructionTsdfCubicSize.value = preset.tsdfCubicSize;
+  elements.reconstructionSdfTrunc.value = preset.sdfTrunc;
+  elements.reconstructionLoopOdometry.value = preset.loopOdometry;
+  elements.reconstructionLoopRegistration.value = preset.loopRegistration;
   updateReconstructionSummary();
 }
 
@@ -712,12 +761,17 @@ function reconstructionRequest() {
     stride: Number(values.stride),
     parameters: {
       voxel_size: Number(values.voxel),
+      depth_min: Number(values.depthMin),
       depth_max: Number(values.depthMax),
       global_registration: values.global,
       n_frames_per_fragment: Number(values.fragmentSize),
       n_keyframes_per_n_frame: Number(values.keyframeInterval),
       icp_method: values.icp,
       depth_diff_max: Number(values.depthDiff),
+      tsdf_cubic_size: Number(values.tsdfCubicSize),
+      sdf_trunc: Number(values.sdfTrunc),
+      preference_loop_closure_odometry: Number(values.loopOdometry),
+      preference_loop_closure_registration: Number(values.loopRegistration),
     },
   };
 }
@@ -782,6 +836,121 @@ async function fetchDevices(refresh = false) {
     app.deviceBusy = false;
     elements.refreshDevices.disabled = Boolean(app.state && app.state.task);
     elements.refreshDevices.textContent = "重新检测";
+  }
+}
+
+function cameraDeviceMetadata(device) {
+  const values = [];
+  if (device.serial) values.push(`S/N ${device.serial}`);
+  if (device.firmware) values.push(`固件 ${device.firmware}`);
+  if (device.usb_type) values.push(`USB ${device.usb_type}`);
+  if (device.product_line) values.push(device.product_line);
+  return values.join(" · ") || "设备未提供更多硬件元数据";
+}
+
+function renderCameraDeviceSummary(item, hardware) {
+  elements.cameraDeviceSummary.replaceChildren();
+  const devices = Array.isArray(item?.devices) ? item.devices : [];
+  let status = "等待设备检测";
+  if (item?.available) status = `${devices.length} 台在线`;
+  else if (item?.error) status = "设备检测受限";
+  else if (item) status = "当前未发现设备";
+
+  const heading = document.createElement("header");
+  heading.append(
+    createTextElement("strong", "", "已检测设备"),
+    createTextElement("small", "", status),
+  );
+  elements.cameraDeviceSummary.append(heading);
+
+  if (!devices.length) {
+    const detail = item?.error
+      ? `无法读取设备信息：${item.error}`
+      : "配置参数仍可查看；接入设备后点击“重新检测”可刷新硬件信息。";
+    elements.cameraDeviceSummary.append(
+      createTextElement("p", "camera-device-empty", detail),
+    );
+    return;
+  }
+
+  const selectedIndex = hardware === app.selectedHardware
+    ? elements.deviceIndex.value
+    : String(devices[0].index);
+  const list = createTextElement("div", "camera-device-list", "");
+  for (const device of devices) {
+    const row = document.createElement("article");
+    row.className = `camera-device-item${String(device.index) === selectedIndex ? " selected" : ""}`;
+    row.append(
+      createTextElement("strong", "", `设备 ${device.index} · ${device.name}`),
+      createTextElement("small", "", cameraDeviceMetadata(device)),
+    );
+    list.append(row);
+  }
+  elements.cameraDeviceSummary.append(list);
+}
+
+function renderCameraConfiguration(configuration) {
+  elements.cameraParametersList.replaceChildren();
+  elements.cameraParametersNotes.replaceChildren();
+  elements.cameraParametersSource.textContent = configuration?.path || "—";
+
+  if (!configuration || configuration.error) {
+    elements.cameraParametersList.append(
+      createTextElement(
+        "p",
+        "camera-parameters-error",
+        configuration?.error || "参数数据尚未返回，请等待设备检测完成后重试。",
+      ),
+    );
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const parameter of configuration.parameters || []) {
+    const item = document.createElement("article");
+    item.className = "camera-parameter-item";
+    const heading = document.createElement("header");
+    heading.append(
+      createTextElement("strong", "", parameter.label),
+      createTextElement("code", "", parameter.key),
+    );
+    const raw = parameter.value === "" ? '""' : String(parameter.value ?? "未设置");
+    item.append(
+      heading,
+      createTextElement("div", "camera-parameter-value", parameter.display),
+      createTextElement("div", "camera-parameter-raw", `配置值 ${raw}`),
+      createTextElement("p", "", parameter.impact),
+    );
+    fragment.append(item);
+  }
+  elements.cameraParametersList.append(fragment);
+  for (const note of configuration.notes || []) {
+    elements.cameraParametersNotes.append(
+      createTextElement("p", "", `· ${note}`),
+    );
+  }
+}
+
+function openCameraParameters(hardware) {
+  const item = app.devices.get(hardware);
+  const card = elements.cameraCards.find((candidate) => candidate.dataset.hardware === hardware);
+  const fallbackLabel = card?.querySelector(".camera-copy strong")?.textContent || "相机";
+  elements.cameraParametersTitle.textContent = `${item?.label || fallbackLabel} 参数`;
+  elements.cameraParametersSubtitle.textContent = "只读展示当前 Web 录制配置及设备元数据；修改配置文件后将在下次连接时生效。";
+  renderCameraDeviceSummary(item, hardware);
+  renderCameraConfiguration(item?.configuration);
+  if (typeof elements.cameraParametersDialog.showModal === "function") {
+    elements.cameraParametersDialog.showModal();
+  } else {
+    elements.cameraParametersDialog.setAttribute("open", "");
+  }
+}
+
+function closeCameraParameters() {
+  if (typeof elements.cameraParametersDialog.close === "function") {
+    elements.cameraParametersDialog.close();
+  } else {
+    elements.cameraParametersDialog.removeAttribute("open");
   }
 }
 
@@ -1480,6 +1649,19 @@ async function chooseLocalRecording() {
 
 elements.hardwareInputs.forEach((input) => {
   input.addEventListener("change", () => selectHardware(input.value));
+});
+
+for (const button of elements.cameraParameterButtons) {
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openCameraParameters(button.dataset.cameraParameters);
+  });
+}
+
+elements.closeCameraParameters.addEventListener("click", closeCameraParameters);
+elements.dismissCameraParameters.addEventListener("click", closeCameraParameters);
+elements.cameraParametersDialog.addEventListener("click", (event) => {
+  if (event.target === elements.cameraParametersDialog) closeCameraParameters();
 });
 
 elements.refreshDevices.addEventListener("click", () => fetchDevices(true));

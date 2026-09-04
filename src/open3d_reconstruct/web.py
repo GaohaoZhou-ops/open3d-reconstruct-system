@@ -21,8 +21,11 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
 from . import __version__
+from .configuration import read_json_object
 from .paths import (
     DATASETS_DIR,
+    DEFAULT_AZURE_SENSOR_CONFIG,
+    DEFAULT_REALSENSE_SENSOR_CONFIG,
     RECORDINGS_DIR,
     ROOT,
     RUNTIME_DIR,
@@ -70,6 +73,135 @@ HARDWARE: dict[str, dict[str, str]] = {
     },
 }
 
+CAMERA_PARAMETER_DEFINITIONS: dict[str, tuple[dict[str, str], ...]] = {
+    "azure-kinect": (
+        {
+            "key": "color_resolution",
+            "label": "彩色分辨率",
+            "impact": "决定纹理清晰度，也会影响 USB 带宽、解码负载和文件大小。",
+        },
+        {
+            "key": "color_format",
+            "label": "彩色编码",
+            "impact": "MJPG 可显著降低 USB 带宽，但需要 CPU 解码。",
+        },
+        {
+            "key": "depth_mode",
+            "label": "深度模式",
+            "impact": "直接决定深度视场、分辨率、量程与噪声水平。",
+        },
+        {
+            "key": "camera_fps",
+            "label": "采集帧率",
+            "impact": "帧率越高越利于连续运动匹配，同时增加带宽与存储压力。",
+        },
+        {
+            "key": "synchronized_images_only",
+            "label": "仅同步 RGB-D",
+            "impact": "只保留成对同步的彩色与深度帧，避免时间错位。",
+        },
+        {
+            "key": "depth_delay_off_color_usec",
+            "label": "深度相对彩色延迟",
+            "impact": "多传感器或精确时序场景使用；单机通常保持 0。",
+        },
+        {
+            "key": "wired_sync_mode",
+            "label": "有线同步模式",
+            "impact": "控制单机、主机或从机工作方式。",
+        },
+        {
+            "key": "subordinate_delay_off_master_usec",
+            "label": "从机相对主机延迟",
+            "impact": "仅在有线多机同步时生效。",
+        },
+        {
+            "key": "disable_streaming_indicator",
+            "label": "关闭录制指示灯",
+            "impact": "只影响设备指示灯，不影响重建质量。",
+        },
+    ),
+    "realsense": (
+        {
+            "key": "serial",
+            "label": "绑定序列号",
+            "impact": "留空时按页面选择的设备编号连接；填写后固定到指定相机。",
+        },
+        {
+            "key": "color_resolution",
+            "label": "彩色分辨率",
+            "impact": "决定纹理清晰度，并影响带宽与文件大小。",
+        },
+        {
+            "key": "color_format",
+            "label": "彩色格式",
+            "impact": "决定相机输出到 Open3D 的颜色像素格式。",
+        },
+        {
+            "key": "depth_resolution",
+            "label": "深度分辨率",
+            "impact": "直接影响可用几何细节、噪声与带宽。",
+        },
+        {
+            "key": "depth_format",
+            "label": "深度格式",
+            "impact": "Z16 保存 16 位原始深度，是当前重建链路所需格式。",
+        },
+        {
+            "key": "fps",
+            "label": "采集帧率",
+            "impact": "帧率越高越利于连续运动匹配，同时增加带宽与存储压力。",
+        },
+        {
+            "key": "visual_preset",
+            "label": "硬件深度预设",
+            "impact": "RealSense 芯片侧深度算法预设，直接影响噪声、完整度与精度。",
+        },
+    ),
+}
+
+CAMERA_PARAMETER_DISPLAY_VALUES: dict[tuple[str, str], dict[str, str]] = {
+    ("azure-kinect", "color_resolution"): {
+        "K4A_COLOR_RESOLUTION_720P": "1280 × 720",
+        "K4A_COLOR_RESOLUTION_1080P": "1920 × 1080",
+        "K4A_COLOR_RESOLUTION_1440P": "2560 × 1440",
+        "K4A_COLOR_RESOLUTION_1536P": "2048 × 1536",
+        "K4A_COLOR_RESOLUTION_2160P": "3840 × 2160",
+        "K4A_COLOR_RESOLUTION_3072P": "4096 × 3072",
+    },
+    ("azure-kinect", "color_format"): {
+        "K4A_IMAGE_FORMAT_COLOR_MJPG": "MJPG（压缩传输）",
+        "K4A_IMAGE_FORMAT_COLOR_NV12": "NV12",
+        "K4A_IMAGE_FORMAT_COLOR_YUY2": "YUY2",
+        "K4A_IMAGE_FORMAT_COLOR_BGRA32": "BGRA32",
+    },
+    ("azure-kinect", "depth_mode"): {
+        "K4A_DEPTH_MODE_NFOV_2X2BINNED": "NFOV 2×2 Binned · 320 × 288",
+        "K4A_DEPTH_MODE_NFOV_UNBINNED": "NFOV Unbinned · 640 × 576",
+        "K4A_DEPTH_MODE_WFOV_2X2BINNED": "WFOV 2×2 Binned · 512 × 512",
+        "K4A_DEPTH_MODE_WFOV_UNBINNED": "WFOV Unbinned · 1024 × 1024",
+        "K4A_DEPTH_MODE_PASSIVE_IR": "Passive IR · 1024 × 1024",
+    },
+    ("azure-kinect", "camera_fps"): {
+        "K4A_FRAMES_PER_SECOND_5": "5 FPS",
+        "K4A_FRAMES_PER_SECOND_15": "15 FPS",
+        "K4A_FRAMES_PER_SECOND_30": "30 FPS",
+    },
+    ("azure-kinect", "wired_sync_mode"): {
+        "K4A_WIRED_SYNC_MODE_STANDALONE": "单机",
+        "K4A_WIRED_SYNC_MODE_MASTER": "主机",
+        "K4A_WIRED_SYNC_MODE_SUBORDINATE": "从机",
+    },
+    ("realsense", "visual_preset"): {
+        "RS2_RS400_VISUAL_PRESET_CUSTOM": "Custom",
+        "RS2_RS400_VISUAL_PRESET_DEFAULT": "Default",
+        "RS2_RS400_VISUAL_PRESET_HAND": "Hand",
+        "RS2_RS400_VISUAL_PRESET_HIGH_ACCURACY": "High Accuracy（高精度）",
+        "RS2_RS400_VISUAL_PRESET_HIGH_DENSITY": "High Density（高密度）",
+        "RS2_RS400_VISUAL_PRESET_MEDIUM_DENSITY": "Medium Density（中密度）",
+    },
+}
+
 RECONSTRUCTION_PARAMETER_RULES: dict[str, dict[str, Any]] = {
     "n_frames_per_fragment": {
         "kind": "integer",
@@ -81,10 +213,26 @@ RECONSTRUCTION_PARAMETER_RULES: dict[str, dict[str, Any]] = {
         "minimum": 2,
         "maximum": 30,
     },
+    "depth_min": {"kind": "number", "minimum": 0.0, "maximum": 5.0},
     "depth_max": {"kind": "number", "minimum": 0.5, "maximum": 10.0},
     "voxel_size": {"kind": "number", "minimum": 0.01, "maximum": 0.2},
     "depth_diff_max": {"kind": "number", "minimum": 0.01, "maximum": 0.3},
-    "icp_method": {"kind": "choice", "choices": {"point_to_plane", "color"}},
+    "tsdf_cubic_size": {"kind": "number", "minimum": 0.512, "maximum": 10.24},
+    "sdf_trunc": {"kind": "number", "minimum": 0.005, "maximum": 0.2},
+    "preference_loop_closure_odometry": {
+        "kind": "number",
+        "minimum": 0.01,
+        "maximum": 20.0,
+    },
+    "preference_loop_closure_registration": {
+        "kind": "number",
+        "minimum": 0.01,
+        "maximum": 20.0,
+    },
+    "icp_method": {
+        "kind": "choice",
+        "choices": {"point_to_point", "point_to_plane", "color", "generalized"},
+    },
     "global_registration": {"kind": "choice", "choices": {"fgr", "ransac"}},
 }
 
@@ -107,6 +255,80 @@ def _display_path(path: Path | None) -> str | None:
         return str(absolute.relative_to(ROOT.resolve()))
     except ValueError:
         return str(path.resolve())
+
+
+def _camera_parameter_display(family: str, key: str, value: object) -> str:
+    raw = "" if value is None else str(value).strip()
+    mapped = CAMERA_PARAMETER_DISPLAY_VALUES.get((family, key), {}).get(raw)
+    if mapped is not None:
+        return mapped
+    if key == "serial" and not raw:
+        return "自动选择页面中的设备"
+    if key in {"color_resolution", "depth_resolution"} and "," in raw:
+        return raw.replace(",", " × ")
+    if key == "fps" and raw:
+        return f"{raw} FPS"
+    if key in {
+        "synchronized_images_only",
+        "disable_streaming_indicator",
+    }:
+        normalized = raw.lower()
+        if normalized in {"true", "1"}:
+            return "开启"
+        if normalized in {"false", "0"}:
+            return "关闭"
+    if key.endswith("_usec") and raw:
+        return f"{raw} µs"
+    return raw or "未设置"
+
+
+def _camera_configuration(hardware_id: str) -> dict[str, Any]:
+    spec = HARDWARE.get(hardware_id)
+    if spec is None:
+        raise ValueError(f"未知相机类型: {hardware_id}")
+    family = spec["camera"]
+    config_path = (
+        DEFAULT_AZURE_SENSOR_CONFIG
+        if family == "azure-kinect"
+        else DEFAULT_REALSENSE_SENSOR_CONFIG
+    )
+    try:
+        values = read_json_object(config_path)
+    except ValueError as exc:
+        return {
+            "path": _display_path(config_path),
+            "parameters": [],
+            "error": str(exc),
+            "notes": [],
+        }
+
+    parameters = []
+    for definition in CAMERA_PARAMETER_DEFINITIONS[family]:
+        key = definition["key"]
+        raw = values.get(key)
+        parameters.append(
+            {
+                **definition,
+                "value": raw,
+                "display": _camera_parameter_display(family, key, raw),
+            }
+        )
+
+    notes = [
+        "这里展示的是 Web 下次连接录制时读取的配置；查看参数不会打开、停止或重启相机。"
+    ]
+    if family == "azure-kinect":
+        notes.append("Azure Kinect 的 IMU 会被录制和实时显示，但经典 RGB-D 重建不融合 IMU。")
+    else:
+        notes.append("硬件深度预设由 librealsense 在相机侧应用；录制文件中的实际 depth_scale 会在提取时自动带入重建。")
+        if hardware_id == "d435i":
+            notes.append("当前 Open3D BAG 录制链路不采集 D435i IMU，D435i 与 D435 使用同一套 RGB-D 配置。")
+    return {
+        "path": _display_path(config_path),
+        "parameters": parameters,
+        "error": None,
+        "notes": notes,
+    }
 
 
 def _file_summary(path: Path | None) -> dict[str, Any] | None:
@@ -260,6 +482,24 @@ def _validated_reconstruction_parameters(value: object) -> dict[str, Any]:
     if frames is not None and keyframe_interval is not None and keyframe_interval > frames:
         raise WebActionError(
             "关键帧间隔不能大于每个局部片段的帧数",
+            HTTPStatus.BAD_REQUEST,
+        )
+    depth_min = result.get("depth_min")
+    depth_max = result.get("depth_max")
+    if depth_min is not None and depth_max is not None and depth_min >= depth_max:
+        raise WebActionError(
+            "最小深度必须小于最大深度",
+            HTTPStatus.BAD_REQUEST,
+        )
+    tsdf_cubic_size = result.get("tsdf_cubic_size")
+    sdf_trunc = result.get("sdf_trunc")
+    if (
+        tsdf_cubic_size is not None
+        and sdf_trunc is not None
+        and sdf_trunc < tsdf_cubic_size / 512.0
+    ):
+        raise WebActionError(
+            "SDF 截断距离不能小于 TSDF 融合体素边长",
             HTTPStatus.BAD_REQUEST,
         )
     return result
@@ -2019,6 +2259,7 @@ class ControlCenter:
                     "available": False,
                     "devices": [],
                     "error": None,
+                    "configuration": _camera_configuration(hardware_id),
                 }
                 for hardware_id, spec in HARDWARE.items()
             }
@@ -2048,13 +2289,23 @@ class ControlCenter:
                     if not is_supported_device_name(name):
                         continue
                     hardware_id = "d435i" if device_model(name) == "D435i" else "d435"
-                    items[hardware_id]["devices"].append(
-                        {
-                            "index": index,
-                            "name": name,
-                            "serial": str(getattr(device, "serial", "")) or None,
-                        }
-                    )
+                    device_info = {
+                        "index": index,
+                        "name": name,
+                        "serial": str(getattr(device, "serial", "")) or None,
+                    }
+                    for output_key, attribute in (
+                        ("firmware", "firmware_version"),
+                        ("usb_type", "usb_type_descriptor"),
+                        ("product_line", "product_line"),
+                    ):
+                        try:
+                            attribute_value = getattr(device, attribute, None)
+                        except Exception:
+                            attribute_value = None
+                        if attribute_value is not None and str(attribute_value):
+                            device_info[output_key] = str(attribute_value)
+                    items[hardware_id]["devices"].append(device_info)
                     items[hardware_id]["available"] = True
             except Exception as exc:
                 message = str(exc)

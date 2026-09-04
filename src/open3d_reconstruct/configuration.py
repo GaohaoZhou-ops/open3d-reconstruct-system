@@ -91,6 +91,9 @@ def validate_reconstruction_config(config: dict[str, Any]) -> None:
         "voxel_size",
         "depth_diff_max",
         "tsdf_cubic_size",
+        "sdf_trunc",
+        "preference_loop_closure_odometry",
+        "preference_loop_closure_registration",
     ):
         _positive_number(config, key)
     depth_min = config.get("depth_min", 0)
@@ -100,6 +103,8 @@ def validate_reconstruction_config(config: dict[str, Any]) -> None:
         raise ValueError("重建参数 depth_min 不能小于 0")
     if depth_min >= config["depth_max"]:
         raise ValueError("depth_min 必须小于 depth_max")
+    if config["sdf_trunc"] < config["tsdf_cubic_size"] / 512.0:
+        raise ValueError("sdf_trunc 不能小于 TSDF 融合体素边长")
     if config.get("icp_method") not in ALLOWED_ICP_METHODS:
         raise ValueError(
             f"icp_method 必须是 {sorted(ALLOWED_ICP_METHODS)} 之一"

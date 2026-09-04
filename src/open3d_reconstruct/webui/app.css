@@ -79,15 +79,19 @@ button { color: inherit; }
 .quiet-button:disabled { opacity: .45; cursor: wait; }
 
 .camera-grid { margin: 0; padding: 0; display: grid; gap: 6px; border: 0; }
-.camera-card { min-width: 0; min-height: 50px; padding: 8px 9px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.camera-card { min-width: 0; min-height: 50px; padding: 8px 9px; display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); transition: border-color .15s ease, background .15s ease; }
 .camera-card:hover { border-color: var(--line-strong); }
 .camera-card.selected { border-color: rgba(191, 233, 107, .62); background: rgba(191, 233, 107, .055); }
 .camera-card input { position: absolute; opacity: 0; pointer-events: none; }
+.camera-card-select { display: contents; cursor: pointer; }
 .camera-code { width: 32px; height: 28px; display: grid; place-items: center; color: var(--cyan); border: 1px solid rgba(112, 216, 204, .22); border-radius: 6px; background: rgba(112, 216, 204, .05); font: 8px var(--mono); }
 .camera-copy { min-width: 0; }
 .camera-copy strong, .camera-copy small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .camera-copy strong { font-size: 11px; }
 .camera-copy small { margin-top: 3px; color: var(--dim); font: 8px var(--mono); }
+.camera-card-actions { display: grid; justify-items: end; gap: 4px; }
+.camera-card-actions button { padding: 0 1px; color: var(--cyan); border: 0; background: none; cursor: pointer; font-size: 8px; }
+.camera-card-actions button:hover { color: var(--text); }
 .device-state { padding: 4px 6px; color: var(--dim); border: 1px solid var(--line); border-radius: 99px; font: 8px var(--mono); white-space: nowrap; }
 .device-state.available { color: var(--accent); border-color: rgba(191, 233, 107, .25); }
 .device-state.error { color: var(--amber); }
@@ -313,13 +317,14 @@ input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 .log-line.success { color: var(--accent); }
 .log-line.error { color: #f2a19b; }
 
-.reconstruction-dialog, .recording-manager-dialog, .delete-recording-dialog { max-height: calc(100vh - 28px); padding: 0; overflow: auto; color: var(--text); border: 1px solid var(--line-strong); border-radius: 14px; background: #111618; box-shadow: 0 24px 80px rgba(0, 0, 0, .62); }
+.reconstruction-dialog, .camera-parameters-dialog, .recording-manager-dialog, .delete-recording-dialog { max-height: calc(100vh - 28px); padding: 0; overflow: auto; color: var(--text); border: 1px solid var(--line-strong); border-radius: 14px; background: #111618; box-shadow: 0 24px 80px rgba(0, 0, 0, .62); }
 .reconstruction-dialog { width: min(720px, calc(100vw - 28px)); }
+.camera-parameters-dialog { width: min(760px, calc(100vw - 28px)); }
 .recording-manager-dialog { width: min(860px, calc(100vw - 28px)); }
 .delete-recording-dialog { width: min(570px, calc(100vw - 28px)); }
-.reconstruction-dialog::backdrop, .recording-manager-dialog::backdrop, .delete-recording-dialog::backdrop { background: rgba(3, 5, 6, .76); backdrop-filter: blur(5px); }
+.reconstruction-dialog::backdrop, .camera-parameters-dialog::backdrop, .recording-manager-dialog::backdrop, .delete-recording-dialog::backdrop { background: rgba(3, 5, 6, .76); backdrop-filter: blur(5px); }
 .reconstruction-dialog form { padding: 18px; display: grid; gap: 14px; }
-.recording-manager-shell, .delete-recording-shell { padding: 18px; display: grid; gap: 14px; }
+.camera-parameters-shell, .recording-manager-shell, .delete-recording-shell { padding: 18px; display: grid; gap: 14px; }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; }
 .dialog-heading > div { display: flex; align-items: flex-start; gap: 10px; }
 .dialog-heading h2 { margin: 0; font-size: 17px; }
@@ -338,6 +343,7 @@ input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 .advanced-settings summary { padding: 10px 11px; color: var(--muted); cursor: pointer; font-size: 10px; }
 .advanced-settings[open] summary { border-bottom: 1px solid var(--line); }
 .advanced-settings .parameter-grid { padding: 11px; }
+.advanced-note { margin: -2px 11px 11px; color: var(--dim); font-size: 8px; line-height: 1.55; }
 .quality-summary { padding: 10px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
 .quality-indicator { min-width: 58px; padding: 6px 8px; color: #11160b; border-radius: 6px; background: var(--accent); text-align: center; font-size: 9px; font-weight: 800; }
 .quality-indicator.fast { color: #071614; background: var(--cyan); }
@@ -350,6 +356,30 @@ input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 .dialog-actions button { min-width: 112px; height: 38px; border-radius: 8px; cursor: pointer; font-size: 10px; font-weight: 700; }
 .dialog-secondary { color: var(--muted); border: 1px solid var(--line); background: var(--panel-soft); }
 .dialog-primary { color: #11160b; border: 1px solid var(--accent); background: var(--accent); }
+
+.camera-device-summary { min-height: 58px; padding: 10px; display: grid; gap: 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.camera-device-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.camera-device-summary > header strong { font-size: 10px; }
+.camera-device-summary > header small { color: var(--dim); font: 8px var(--mono); }
+.camera-device-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.camera-device-item { min-width: 0; padding: 8px; display: grid; gap: 4px; border: 1px solid var(--line); border-radius: 7px; background: rgba(255, 255, 255, .018); }
+.camera-device-item.selected { border-color: rgba(191, 233, 107, .42); }
+.camera-device-item strong { overflow: hidden; font-size: 9px; white-space: nowrap; text-overflow: ellipsis; }
+.camera-device-item small { overflow: hidden; color: var(--dim); font: 8px/1.45 var(--mono); white-space: nowrap; text-overflow: ellipsis; }
+.camera-device-empty { margin: 0; color: var(--dim); font-size: 9px; line-height: 1.5; }
+.camera-parameters-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.camera-parameter-item { min-width: 0; padding: 10px; display: grid; align-content: start; gap: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
+.camera-parameter-item header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.camera-parameter-item header strong { font-size: 9px; }
+.camera-parameter-item code, .camera-config-source code { color: var(--dim); font: 8px var(--mono); word-break: break-all; }
+.camera-parameter-value { color: var(--cyan); font: 10px/1.4 var(--mono); }
+.camera-parameter-raw { color: var(--dim); font: 7px/1.4 var(--mono); word-break: break-all; }
+.camera-parameter-item p { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.5; }
+.camera-config-source { padding: 9px 10px; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.camera-config-source span { color: var(--muted); font-size: 8px; }
+.camera-parameters-notes { display: grid; gap: 4px; }
+.camera-parameters-notes p { margin: 0; color: var(--dim); font-size: 8px; line-height: 1.5; }
+.camera-parameters-error { margin: 0; padding: 10px; color: var(--red); border: 1px solid rgba(255, 119, 112, .28); border-radius: 8px; font-size: 9px; }
 
 .recording-manager-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: stretch; gap: 7px; }
 .recording-manager-summary span { min-width: 0; padding: 8px 9px; display: grid; gap: 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
@@ -441,9 +471,10 @@ input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
   .viewer-wrap > .viewer-help { right: 99px; bottom: 100px; left: 9px; max-width: none; }
   .viewer-scale { min-width: 132px; }
   .reconstruction-dialog form { padding: 14px; }
-  .recording-manager-shell, .delete-recording-shell { padding: 14px; }
+  .camera-parameters-shell, .recording-manager-shell, .delete-recording-shell { padding: 14px; }
   .preset-grid { grid-template-columns: 1fr; }
   .parameter-grid { grid-template-columns: 1fr; }
+  .camera-device-list, .camera-parameters-list { grid-template-columns: 1fr; }
   .dialog-actions button { min-width: 0; flex: 1; }
   .recording-manager-summary { grid-template-columns: 1fr 1fr; }
   .recording-manager-summary button { min-height: 42px; }

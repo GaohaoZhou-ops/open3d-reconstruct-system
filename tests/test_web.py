@@ -21,6 +21,7 @@ from open3d_reconstruct.web import (
     ControlCenter,
     WEB_MATCH_PREFIX,
     WebActionError,
+    _camera_configuration,
     _clean_recording_name,
     _recording_import_spec,
     _validated_reconstruction_parameters,
@@ -66,16 +67,25 @@ class WebReconstructionParameterTests(unittest.TestCase):
         values = _validated_reconstruction_parameters(
             {
                 "voxel_size": 0.03,
+                "depth_min": 0.2,
                 "depth_max": 4,
                 "n_frames_per_fragment": 80,
                 "n_keyframes_per_n_frame": 5,
-                "icp_method": "color",
+                "icp_method": "generalized",
                 "global_registration": "fgr",
+                "tsdf_cubic_size": 2.048,
+                "sdf_trunc": 0.02,
+                "preference_loop_closure_odometry": 0.1,
+                "preference_loop_closure_registration": 5,
             }
         )
         self.assertEqual(values["voxel_size"], 0.03)
+        self.assertEqual(values["depth_min"], 0.2)
         self.assertEqual(values["depth_max"], 4.0)
         self.assertEqual(values["global_registration"], "fgr")
+        self.assertEqual(values["icp_method"], "generalized")
+        self.assertEqual(values["tsdf_cubic_size"], 2.048)
+        self.assertEqual(values["sdf_trunc"], 0.02)
 
     def test_unknown_or_out_of_range_parameters_are_rejected(self) -> None:
         with self.assertRaises(WebActionError):
@@ -89,6 +99,61 @@ class WebReconstructionParameterTests(unittest.TestCase):
                     "n_keyframes_per_n_frame": 31,
                 }
             )
+        with self.assertRaises(WebActionError):
+            _validated_reconstruction_parameters(
+                {"depth_min": 2.0, "depth_max": 1.0}
+            )
+        with self.assertRaises(WebActionError):
+            _validated_reconstruction_parameters(
+                {"tsdf_cubic_size": 5.12, "sdf_trunc": 0.005}
+            )
+
+    def test_depth_min_is_applied_before_rgbd_creation(self) -> None:
+        import numpy as np
+        import open3d as o3d
+
+        from open3d_reconstruct.vendor.reconstruction_system.open3d_example import (
+            read_rgbd_image,
+        )
+
+        color = o3d.geometry.Image(np.zeros((2, 2, 3), dtype=np.uint8))
+        depth = o3d.geometry.Image(
+            np.array([[100, 300], [500, 0]], dtype=np.uint16)
+        )
+        with mock.patch.object(o3d.io, "read_image", side_effect=[color, depth]):
+            rgbd = read_rgbd_image(
+                "color.png",
+                "depth.png",
+                False,
+                {"depth_min": 0.3, "depth_max": 2.0, "depth_scale": 1000.0},
+            )
+        np.testing.assert_allclose(
+            np.asarray(rgbd.depth),
+            np.array([[0.0, 0.3], [0.5, 0.0]], dtype=np.float32),
+        )
+
+
+class WebCameraParameterTests(unittest.TestCase):
+    def test_camera_configuration_reports_capture_and_hardware_parameters(self) -> None:
+        azure = _camera_configuration("azure-kinect")
+        azure_parameters = {item["key"]: item for item in azure["parameters"]}
+        self.assertEqual(azure["path"], "config/azure-kinect.json")
+        self.assertEqual(
+            azure_parameters["depth_mode"]["display"],
+            "WFOV 2×2 Binned · 512 × 512",
+        )
+        self.assertEqual(azure_parameters["camera_fps"]["display"], "30 FPS")
+
+        realsense = _camera_configuration("d435i")
+        realsense_parameters = {
+            item["key"]: item for item in realsense["parameters"]
+        }
+        self.assertEqual(realsense["path"], "config/realsense-d435.json")
+        self.assertEqual(
+            realsense_parameters["visual_preset"]["display"],
+            "High Accuracy（高精度）",
+        )
+        self.assertTrue(any("D435i IMU" in note for note in realsense["notes"]))
 
 
 class WebProgressTests(unittest.TestCase):
@@ -502,6 +567,13 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn("开始重建".encode(), page)
         self.assertIn("运动数据".encode(), page)
         self.assertIn("确认重建参数".encode(), page)
+        self.assertIn("查看参数".encode(), page)
+        self.assertIn(b'data-camera-parameters="azure-kinect"', page)
+        self.assertIn(b"camera-parameters-dialog", page)
+        self.assertIn(b"reconstruction-depth-min", page)
+        self.assertIn(b"reconstruction-tsdf-cubic-size", page)
+        self.assertIn(b"reconstruction-sdf-trunc", page)
+        self.assertIn(b"reconstruction-loop-registration", page)
         self.assertIn(b"imu-orientation", page)
         self.assertIn(b"process-activity", page)
         self.assertIn(b"matching-heatmap", page)
@@ -546,6 +618,9 @@ class WebHttpTests(unittest.TestCase):
         self.assertNotIn(b"function uploadRecording", script)
         self.assertIn(b"wrapRadians(this.pitch", script)
         self.assertIn(b"reconstructionRequest", script)
+        self.assertIn(b"openCameraParameters", script)
+        self.assertIn(b"tsdf_cubic_size", script)
+        self.assertIn(b"preference_loop_closure_registration", script)
         self.assertIn(b"processViewer.load", script)
         self.assertIn(b".camera-card", style)
         self.assertIn(b".capture-visual", style)

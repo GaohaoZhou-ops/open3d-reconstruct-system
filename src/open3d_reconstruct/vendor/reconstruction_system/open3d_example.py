@@ -191,6 +191,15 @@ def add_if_exists(path_dataset, folder_names):
 def read_rgbd_image(color_file, depth_file, convert_rgb_to_intensity, config):
     color = o3d.io.read_image(color_file)
     depth = o3d.io.read_image(depth_file)
+    depth_min = float(config.get("depth_min", 0))
+    if depth_min > 0:
+        depth_values = np.asarray(depth)
+        minimum_raw_depth = depth_min * float(config["depth_scale"])
+        too_near = (depth_values > 0) & (depth_values < minimum_raw_depth)
+        if np.any(too_near):
+            filtered_depth = np.array(depth_values, copy=True)
+            filtered_depth[too_near] = 0
+            depth = o3d.geometry.Image(filtered_depth)
     rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
         color,
         depth,
