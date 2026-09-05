@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import os
@@ -64,6 +65,112 @@ class WebNameTests(unittest.TestCase):
 
 
 class WebNativePickerTests(unittest.TestCase):
+    def test_windows_picker_uses_powershell_and_environment_filters(self) -> None:
+        initial = Path(r"C:\包含 空格")
+        completed = subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=0,
+            stdout="C:\\扫描结果.ply\n",
+            stderr="",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "win32"),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            selected = _native_file_picker(
+                title="选择 PLY 点云文件",
+                extensions=("ply",),
+                initial_directory=initial,
+            )
+
+        self.assertEqual(selected, r"C:\扫描结果.ply")
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        self.assertIn("-STA", command)
+        self.assertIn("-EncodedCommand", command)
+        script = base64.b64decode(command[-1]).decode("utf-16-le")
+        self.assertIn("$owner.TopMost = $true", script)
+        self.assertIn("$dialog.ShowDialog($owner)", script)
+        self.assertIn("$owner.Dispose()", script)
+        self.assertEqual(environment["OPEN3D_RECONSTRUCT_PICKER_INITIAL"], str(initial))
+        self.assertIn("*.ply", environment["OPEN3D_RECONSTRUCT_PICKER_FILTER"])
+
+    def test_wsl_picker_uses_windows_dialog_and_translates_paths(self) -> None:
+        initial = Path("/home/user/project/data/recordings")
+        completed = subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=0,
+            stdout="C:\\Users\\user\\Videos\\扫描结果.mkv\n",
+            stderr="",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", True),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web._translate_wsl_path",
+                side_effect=(
+                    r"\\wsl.localhost\Ubuntu\home\user\project\data\recordings",
+                    "/mnt/c/Users/user/Videos/扫描结果.mkv",
+                ),
+            ) as translate,
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            selected = _native_file_picker(
+                title="打开本地录制",
+                extensions=("mkv", "bag"),
+                initial_directory=initial,
+            )
+
+        self.assertEqual(selected, "/mnt/c/Users/user/Videos/扫描结果.mkv")
+        self.assertEqual(translate.call_count, 2)
+        environment = run.call_args.kwargs["env"]
+        self.assertIn("OPEN3D_RECONSTRUCT_PICKER_TITLE/w", environment["WSLENV"])
+        self.assertEqual(
+            environment["OPEN3D_RECONSTRUCT_PICKER_INITIAL"],
+            r"\\wsl.localhost\Ubuntu\home\user\project\data\recordings",
+        )
+
+    def test_wsl_picker_reports_windows_dialog_errors(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=1,
+            stdout="",
+            stderr="WPF dialog unavailable",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", True),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                WebActionError, "WPF dialog unavailable"
+            ):
+                _native_file_picker(
+                    title="打开本地录制",
+                    extensions=("mkv", "bag"),
+                )
+
     def test_macos_picker_uses_osascript_and_passes_initial_directory(self) -> None:
         initial = Path("/tmp/包含 空格")
         completed = subprocess.CompletedProcess(
@@ -333,6 +440,23 @@ class WebRecordingManagementTests(unittest.TestCase):
 
     def test_cross_device_reference_falls_back_to_symlink(self) -> None:
         source = self.source(".bag")
+        if os.name == "nt":
+            with (
+                mock.patch(
+                    "open3d_reconstruct.web.os.link",
+                    side_effect=OSError(errno.EXDEV, "cross-device link"),
+                ),
+                mock.patch.object(
+                    Path,
+                    "symlink_to",
+                    side_effect=OSError(1314, "privilege not held"),
+                ),
+                self.assertRaisesRegex(WebActionError, "开发人员模式"),
+            ):
+                self.controller.reference_local_recording(
+                    source, hardware="d435i"
+                )
+            return
         with mock.patch(
             "open3d_reconstruct.web.os.link",
             side_effect=OSError(errno.EXDEV, "cross-device link"),
@@ -358,6 +482,7 @@ class WebRecordingManagementTests(unittest.TestCase):
         )
         with (
             mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", False),
             mock.patch(
                 "open3d_reconstruct.web.shutil.which",
                 return_value="/usr/bin/zenity",
@@ -453,6 +578,7 @@ class WebPointCloudTests(unittest.TestCase):
         )
         with (
             mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", False),
             mock.patch(
                 "open3d_reconstruct.web.shutil.which",
                 return_value="/usr/bin/zenity",
@@ -501,18 +627,21 @@ class ControlCenterProcessTests(unittest.TestCase):
             prefix="web-controller-test-", dir=ROOT / ".cache"
         )
         self.temp_path = Path(self.temporary.name)
-        self.launcher = self.temp_path / "fake-launcher"
+        self.launcher = self.temp_path / "fake-launcher.py"
         python = Path(os.sys.executable).resolve()
         self.launcher.write_text(
             f"""#!{python}
 import signal
 import sys
 import time
+import os
 from pathlib import Path
 
 args = sys.argv[1:]
 if args[0] == "record":
     output = Path(args[args.index("--output") + 1])
+    live_dir = os.environ.get("OPEN3D_RECONSTRUCT_LIVE_DIR")
+    stop_file = Path(live_dir) / "stop.requested" if live_dir else None
     def finish(_signum, _frame):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"valid fake recording")
@@ -521,6 +650,8 @@ if args[0] == "record":
     signal.signal(signal.SIGINT, finish)
     print("fake recording ready", flush=True)
     while True:
+        if stop_file is not None and stop_file.is_file():
+            finish(None, None)
         time.sleep(0.05)
 elif args[0] == "reconstruct":
     dataset = Path(args[args.index("--dataset") + 1])
@@ -896,7 +1027,7 @@ class WebHttpTests(unittest.TestCase):
             self.assertTrue(process_depth.startswith(b"\xff\xd8"))
             self.assertEqual(headers["Content-Type"], "image/jpeg")
             process_model, headers = self.get("/api/process/model")
-            self.assertTrue(process_model.startswith(b"ply\n"))
+            self.assertEqual(process_model.splitlines()[0], b"ply")
             self.assertEqual(headers["Content-Type"], "model/ply")
 
             with self.controller._lock:
@@ -936,8 +1067,9 @@ class WebHttpTests(unittest.TestCase):
                 "open3d_reconstruct.web.MESH_PREVIEW_TARGET_TRIANGLES", 1
             ):
                 preview_payload, headers = self.get("/api/files/mesh-preview")
-            self.assertTrue(preview_payload.startswith(b"ply\n"))
-            self.assertIn(b"element face 1\n", preview_payload)
+            preview_lines = preview_payload.splitlines()
+            self.assertEqual(preview_lines[0], b"ply")
+            self.assertIn(b"element face 1", preview_lines)
             self.assertEqual(headers["Content-Type"], "model/ply")
             preview = source.with_name("integrated.preview-v2.ply")
             self.assertTrue(preview.is_file())

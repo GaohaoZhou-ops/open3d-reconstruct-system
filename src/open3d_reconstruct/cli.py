@@ -212,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     udev_parser = subparsers.add_parser(
         "udev-install",
-        help="在 Linux 安装设备权限规则（macOS 不使用 udev）",
+        help="在 Linux 安装设备权限规则（Windows/macOS 不使用 udev）",
     )
     _add_camera_option(udev_parser, default="all", allow_all=True)
     subparsers.add_parser("self-test", help="运行不需要设备的离线 RGB-D 重建自检")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -16,7 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from . import __version__
 from .paths import ROOT, RUNTIME_DIR, ensure_local_directories
@@ -90,7 +94,89 @@ def service_files(runtime_dir: Path | None = None) -> ServiceFiles:
     return ServiceFiles(resolved)
 
 
+def _try_lock(lock_file) -> bool:
+    """Acquire the first byte of a project-local lock without blocking."""
+    if os.name == "nt":
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write("0")
+            lock_file.flush()
+        lock_file.seek(0)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
+    return True
+
+
+def _unlock(lock_file) -> None:
+    if os.name == "nt":
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _windows_process_stat(pid: int) -> tuple[int, str] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ) or not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None
+        created = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+        return created, "R" if exit_code.value == still_active else "Z"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_stat(pid: int) -> tuple[int, str] | None:
+    if os.name == "nt":
+        return _windows_process_stat(pid)
     try:
         value = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
     except (OSError, UnicodeError):
@@ -142,6 +228,9 @@ def process_matches(metadata: ServiceMetadata) -> bool:
             return False
         if metadata.process_start_ticks is not None:
             return start_ticks == metadata.process_start_ticks
+        return True
+    if os.name == "nt":
+        return False
     try:
         os.kill(metadata.pid, 0)
     except ProcessLookupError:
@@ -194,17 +283,14 @@ class SingletonLease:
             os.O_RDWR | os.O_CREAT,
             0o600,
         )
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         lock_file = os.fdopen(descriptor, "r+", encoding="ascii")
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
+        if not _try_lock(lock_file):
             lock_file.close()
-            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
-                raise
             existing = read_metadata(self.files)
             detail = f"（PID {existing.pid}）" if existing else ""
-            raise RuntimeError(f"Web 服务已有一个实例正在运行{detail}") from exc
+            raise RuntimeError(f"Web 服务已有一个实例正在运行{detail}")
 
         self._lock_file = lock_file
         stat = _process_stat(os.getpid())
@@ -219,7 +305,7 @@ class SingletonLease:
         try:
             self._write_metadata()
         except Exception:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _unlock(lock_file)
             lock_file.close()
             self._lock_file = None
             raise
@@ -257,7 +343,7 @@ class SingletonLease:
                 except FileNotFoundError:
                     pass
         if self._lock_file is not None:
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            _unlock(self._lock_file)
             self._lock_file.close()
             self._lock_file = None
 
@@ -307,13 +393,11 @@ def _cleanup_stale_metadata(files: ServiceFiles) -> bool:
     files.runtime_dir.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(files.lock, os.O_RDWR | os.O_CREAT, 0o600)
     lock_file = os.fdopen(descriptor, "r+", encoding="ascii")
+    acquired = False
     try:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in {errno.EACCES, errno.EAGAIN}:
-                return False
-            raise
+        acquired = _try_lock(lock_file)
+        if not acquired:
+            return False
         current = read_metadata(files)
         if current is None or not process_matches(current):
             try:
@@ -323,6 +407,8 @@ def _cleanup_stale_metadata(files: ServiceFiles) -> bool:
             return True
         return False
     finally:
+        if acquired:
+            _unlock(lock_file)
         lock_file.close()
 
 
@@ -351,6 +437,58 @@ def _print_running(status: ServiceStatus, files: ServiceFiles) -> None:
     print(f"  日志: {files.log}")
 
 
+def _launcher_prefix(launcher: Path | None) -> tuple[list[str], Path | None]:
+    if launcher is None:
+        return (
+            [
+                sys.executable,
+                "-B",
+                "-I",
+                "-u",
+                "-X",
+                "utf8",
+                "-m",
+                "open3d_reconstruct",
+            ],
+            None,
+        )
+    executable = launcher.expanduser().resolve()
+    if not executable.is_file():
+        return [], executable
+    suffix = executable.suffix.lower()
+    if suffix == ".py":
+        return [sys.executable, "-B", "-u", "-X", "utf8", str(executable)], None
+    if os.name == "nt" and suffix in {".cmd", ".bat"}:
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(executable)], None
+    if os.name != "nt" and not os.access(executable, os.X_OK):
+        return [], executable
+    return [str(executable)], None
+
+
+def _format_command(command: list[str]) -> str:
+    return subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)
+
+
+def _request_shutdown(metadata: ServiceMetadata, *, timeout: float = 2.0) -> bool:
+    request = Request(
+        f"http://127.0.0.1:{metadata.port}/api/service/shutdown",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Open3D-Reconstruct": "web",
+            "X-Open3D-Reconstruct-Service": metadata.instance_id,
+        },
+    )
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            value = json.loads(response.read(64 * 1024 + 1))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("ok") is True
+
+
 def start_service(
     *,
     port: int = DEFAULT_SERVICE_PORT,
@@ -375,15 +513,15 @@ def start_service(
         return 1
     _cleanup_stale_metadata(selected)
 
-    executable = (launcher or (ROOT / "open3d-reconstruct")).resolve()
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        print(f"错误: 项目启动器不可执行: {executable}", file=sys.stderr)
+    prefix, invalid_launcher = _launcher_prefix(launcher)
+    if invalid_launcher is not None:
+        print(f"错误: 项目启动器不可执行: {invalid_launcher}", file=sys.stderr)
         return 1
     if not 1 <= port <= 65535:
         print("错误: 端口必须在 1 到 65535 之间", file=sys.stderr)
         return 1
 
-    command = [str(executable), "web", "--no-browser", "--port", str(port)]
+    command = [*prefix, "web", "--no-browser", "--port", str(port)]
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
     environment[RUNTIME_ENVIRONMENT] = str(selected.runtime_dir)
@@ -391,7 +529,7 @@ def start_service(
         "\n"
         + "=" * 72
         + f"\n{datetime.now().astimezone().isoformat(timespec='seconds')} "
-        + shlex.join(command)
+        + _format_command(command)
         + "\n"
     ).encode("utf-8")
     descriptor = os.open(
@@ -399,10 +537,18 @@ def start_service(
         os.O_WRONLY | os.O_CREAT | os.O_APPEND,
         0o600,
     )
-    os.fchmod(descriptor, 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "ab", buffering=0) as log_stream:
         log_stream.write(separator)
         try:
+            process_options: dict[str, Any] = {}
+            if os.name == "nt":
+                process_options["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                )
+            else:
+                process_options["start_new_session"] = True
             process = subprocess.Popen(
                 command,
                 cwd=ROOT,
@@ -410,8 +556,8 @@ def start_service(
                 stdin=subprocess.DEVNULL,
                 stdout=log_stream,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
                 close_fds=True,
+                **process_options,
             )
         except OSError as exc:
             print(f"错误: 无法启动 Web 服务: {exc}", file=sys.stderr)
@@ -440,11 +586,13 @@ def start_service(
         time.sleep(0.1)
 
     print("错误: Web 服务启动健康检查超时。", file=sys.stderr)
+    metadata = read_metadata(selected)
+    if metadata is not None:
+        _request_shutdown(metadata)
     try:
-        os.kill(process.pid, signal.SIGINT)
         process.wait(timeout=5)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        pass
+    except subprocess.TimeoutExpired:
+        process.terminate()
     return 1
 
 
@@ -481,15 +629,24 @@ def stop_service(
         return 0
 
     print(f"正在停止 Web 服务（PID {metadata.pid}）……")
-    try:
-        os.kill(metadata.pid, signal.SIGINT)
-    except ProcessLookupError:
-        _cleanup_stale_metadata(selected)
-        print("Web 服务已经停止。")
-        return 0
-    except PermissionError as exc:
-        print(f"错误: 无法向服务进程发送停止信号: {exc}", file=sys.stderr)
-        return 1
+    requested = _request_shutdown(metadata)
+    if not requested:
+        if os.name == "nt":
+            print(
+                "错误: 服务未接受安全停止请求；为避免损坏正在封装的录制文件，"
+                "未强制终止进程。",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            os.kill(metadata.pid, signal.SIGINT)
+        except ProcessLookupError:
+            _cleanup_stale_metadata(selected)
+            print("Web 服务已经停止。")
+            return 0
+        except PermissionError as exc:
+            print(f"错误: 无法向服务进程发送停止信号: {exc}", file=sys.stderr)
+            return 1
 
     deadline = time.monotonic() + shutdown_timeout
     while time.monotonic() < deadline:

@@ -12,6 +12,7 @@ from typing import Any
 LIVE_DIR_ENV = "OPEN3D_RECONSTRUCT_LIVE_DIR"
 LIVE_HARDWARE_ENV = "OPEN3D_RECONSTRUCT_LIVE_HARDWARE"
 LIVE_FPS_ENV = "OPEN3D_RECONSTRUCT_LIVE_FPS"
+STOP_REQUEST_FILE = "stop.requested"
 
 DEFAULT_PREVIEW_FPS = {
     "azure-kinect": 20.0,
@@ -113,6 +114,10 @@ class LivePreviewPublisher:
     @property
     def enabled(self) -> bool:
         return True
+
+    @property
+    def stop_requested(self) -> bool:
+        return (self.directory / STOP_REQUEST_FILE).is_file()
 
     def begin_capture(self) -> None:
         self.started = time.monotonic()

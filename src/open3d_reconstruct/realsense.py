@@ -301,10 +301,16 @@ def record(
             print(f"开始无界面录制 {duration_text}。按 Ctrl+C 可提前保存退出。")
 
         while not stopped:
+            if publisher is not None and publisher.stop_requested:
+                print("收到 Web 安全停止请求，正在封装并保存 BAG……")
+                break
             if seconds is not None and time.monotonic() - started >= seconds:
                 break
             rgbd = sensor.capture_frame(True, align_depth_to_color)
             if rgbd.is_empty():
+                if publisher is not None and publisher.stop_requested:
+                    print("收到 Web 安全停止请求，正在封装并保存 BAG……")
+                    break
                 if time.monotonic() - last_frame > 10:
                     raise RuntimeError("录制期间连续 10 秒未收到同步 RGB-D 帧")
                 continue

@@ -4,6 +4,7 @@ import contextlib
 import io
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,7 +68,7 @@ class ServiceLifecycleTests(unittest.TestCase):
         ):
             stop_service(files=self.files, shutdown_timeout=5)
         # Popen construction reaps any completed child retained by subprocess.
-        subprocess.run(["/usr/bin/true"], check=True)
+        subprocess.run([sys.executable, "-c", "pass"], check=True)
         self.temporary.cleanup()
 
     def test_background_start_is_idempotent_and_stop_is_graceful(self) -> None:
@@ -76,7 +77,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             started = start_service(
                 port=self.port,
                 files=self.files,
-                launcher=ROOT / "open3d-reconstruct",
+                launcher=None,
                 startup_timeout=8,
             )
         self.assertEqual(started, 0, output.getvalue())
@@ -89,7 +90,7 @@ class ServiceLifecycleTests(unittest.TestCase):
             duplicate = start_service(
                 port=self.port,
                 files=self.files,
-                launcher=ROOT / "open3d-reconstruct",
+                launcher=None,
                 startup_timeout=8,
             )
         self.assertEqual(duplicate, 0, output.getvalue())

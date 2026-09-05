@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,46 @@ class PortableMKVCalibrationTests(unittest.TestCase):
         self.assertEqual(result.tags["K4A_DEPTH_MODE"], "WFOV_2X2BINNED")
         self.assertEqual(result.tags["K4A_DEVICE_SERIAL_NUMBER"], "serial")
 
+    def test_probe_can_use_bundled_ffmpeg_without_ffprobe(self) -> None:
+        from open3d_reconstruct.mkv_portable import probe_mkv
+
+        completed = subprocess.CompletedProcess(
+            args=["bundled-ffmpeg"],
+            returncode=1,
+            stdout="",
+            stderr="""
+Input #0, matroska,webm, from 'recording.mkv':
+  Metadata:
+    K4A_DEVICE_SERIAL_NUMBER: serial
+  Stream #0:0(eng): Video: mjpeg, yuvj422p, 1280x720, 30 fps
+      Metadata:
+        title           : COLOR
+        K4A_COLOR_MODE  : MJPG_720P
+  Stream #0:1(eng): Video: rawvideo, gray16be, 512x512, 30 fps
+      Metadata:
+        title           : DEPTH
+        K4A_DEPTH_MODE  : WFOV_2X2BINNED
+""",
+        )
+        with mock.patch(
+            "open3d_reconstruct.mkv_portable.subprocess.run",
+            return_value=completed,
+        ) as run:
+            result = probe_mkv(
+                Path("recording.mkv"), None, ffmpeg="bundled-ffmpeg"
+            )
+
+        self.assertEqual(
+            (result.color.index, result.color.width, result.color.height),
+            (0, 1280, 720),
+        )
+        self.assertEqual(
+            (result.depth.index, result.depth.width, result.depth.height),
+            (1, 512, 512),
+        )
+        self.assertEqual(result.tags["K4A_DEVICE_SERIAL_NUMBER"], "serial")
+        self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+
     def test_rational6kt_uses_the_k4a_tangential_convention(self) -> None:
         import numpy as np
 
@@ -173,6 +214,30 @@ class PortableMKVCalibrationTests(unittest.TestCase):
         self.assertEqual(aligned_depth.shape, (512, 512))
         np.testing.assert_array_equal(aligned_color[256, 256], [12, 34, 56])
         self.assertEqual(int(aligned_depth[256, 256]), 1000)
+
+
+class AzureExtractionRoutingTests(unittest.TestCase):
+    def test_wsl_uses_portable_calibrated_mkv_extractor(self) -> None:
+        from open3d_reconstruct import azure
+
+        source = Path("recording.mkv")
+        destination = Path("dataset")
+        with (
+            mock.patch.object(azure, "IS_WSL", True),
+            mock.patch.object(azure, "K4A_LIVE_SUPPORTED", True),
+            mock.patch(
+                "open3d_reconstruct.mkv_portable.extract_mkv_portable",
+                return_value=destination,
+            ) as portable,
+        ):
+            result = azure.extract_mkv(
+                source, destination, force=True, stride=2
+            )
+
+        self.assertEqual(result, destination)
+        portable.assert_called_once_with(
+            source, destination, force=True, stride=2
+        )
 
 
 class ExtractionSafetyTests(unittest.TestCase):

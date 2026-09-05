@@ -8,13 +8,24 @@ Open3D is Copyright (c) 2018-2024 www.open3d.org and is distributed under the MI
 
 ## Azure Kinect Sensor SDK
 
-`setup.sh` downloads the unmodified Microsoft `libk4a1.4_1.4.1_amd64.deb` package and extracts it locally. The package includes `libk4a`, `libk4arecord`, the proprietary Azure Kinect depth engine, license terms, redistribution list, and third-party notices.
+`setup.sh` downloads the unmodified Microsoft `libk4a1.4_1.4.1_amd64.deb`
+package on Linux. `setup.ps1` downloads the unmodified
+`Microsoft.Azure.Kinect.Sensor` 1.4.1 NuGet package on Windows. Both are
+extracted locally and include `libk4a`, `libk4arecord`, the proprietary Azure
+Kinect depth engine, license terms, redistribution list, and third-party
+notices.
 
 After setup, those documents are available at:
 
 - `.deps/k4a/usr/share/doc/libk4a1.4/LICENSE.txt`
 - `.deps/k4a/usr/share/doc/libk4a1.4/REDIST.txt`
 - `.deps/k4a/usr/share/doc/libk4a1.4/ThirdPartyNotices.txt`
+
+On Windows they are available at:
+
+- `.deps/k4a-windows/LICENSE.txt`
+- `.deps/k4a-windows/REDIST.txt`
+- `.deps/k4a-windows/ThirdPartyNotices.txt`
 
 Microsoft's upstream project is archived at <https://github.com/microsoft/Azure-Kinect-Sensor-SDK>.
 
@@ -31,4 +42,8 @@ under the Apache License 2.0:
 
 ## Python packages and managed Python
 
-Python package names, versions, sources, and hashes are recorded in `uv.lock`. CPython is installed locally by `uv` from Astral's python-build-standalone distributions. Each installed distribution retains its own license metadata in `.venv` or `.python`.
+Python package names, versions, sources, and hashes are recorded in `uv.lock`.
+CPython is installed locally by `uv` from Astral's python-build-standalone
+distributions. Each installed distribution retains its own license metadata in
+`.venv`/`.python` or the Windows-specific `.venv-windows`/`.python-windows`
+directories.

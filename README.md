@@ -10,33 +10,94 @@ SLAC 与颜色映射优化。
 
 ## 当前状态
 
-- 目标系统：Ubuntu 20.04 x86_64、macOS arm64/x86_64
-- Python：项目内 CPython 3.12 + `.venv`
-- Open3D：0.19.0；macOS 使用官方 universal2 wheel，已在 Apple Silicon 验证
-- GPU：Linux 自动使用 NVIDIA CUDA，Apple Silicon 自动使用 Metal/MPS；设备、驱动或
-  PyTorch 后端不可用时自动回退 Open3D CPU 路径
-- Azure Kinect：Linux 使用 `.deps/k4a/` 中的 Sensor SDK 1.4.1；macOS 使用
-  FFmpeg + MKV 内嵌工厂标定完成已有录像的离线提取与重建
+- 目标系统：Windows x64、Ubuntu/WSL2 x86_64、macOS arm64/x86_64
+- Python：项目内 CPython 3.12；Linux/macOS 使用 `.venv`，Windows 使用独立的
+  `.venv-windows`
+- Open3D：0.19.0；Windows/Linux 使用官方 x86_64 wheel，macOS 使用官方
+  universal2 wheel
+- GPU：Linux 与 WSL2 自动使用可用的 NVIDIA CUDA，Apple Silicon 自动使用
+  Metal/MPS；Windows 原生版和 Intel Mac 使用 Open3D CPU 路径
+- Azure Kinect：Linux/WSL2 使用 `.deps/k4a/`、Windows 使用
+  `.deps/k4a-windows/` 中的 Sensor SDK 1.4.1；WSL2 与 macOS 使用 FFmpeg + MKV
+  内嵌工厂标定完成已有录像的软件对齐，避开 WSL2 的 K4A OpenGL 变换限制
 - RealSense：Open3D wheel 内置 librealsense，无需系统 SDK 或 `pyrealsense2`；macOS
-  的实时 USB 支持受上游限制，需以实际设备验证
+  的实时 USB 支持受上游限制，WSL2 需要先把 USB 设备转接给发行版
 - D435/D435i：设备枚举、预览、BAG 录制、暂停/继续、提取与一键重建均已接入
 - Web 控制台：录制时实时显示 RGB、深度伪彩和 IMU 三维姿态，重建前可选择速度/质量
   参数，重建时显示阶段心跳、输入帧与局部 PLY；全部使用本机 11920 单口
-- 无设备单元测试和四阶段合成 RGB-D 重建自检：已通过
+- 无设备单元测试和四阶段合成 RGB-D 重建自检：Windows、WSL2、Ubuntu、macOS 已通过
 - macOS 示例 `data/recordings/web-20260903-105959.mkv`：125 帧提取和四阶段重建已通过
-- Azure Kinect 与 D435/D435i 真机采集：Linux 保留原实现；macOS 的 Azure 实时采集
-  因官方 SDK 不支持而明确禁用，RealSense 等待设备接入验证
+- WSL2 同一示例：静态 FFmpeg 软件标定提取 63 帧（stride 2）及四阶段 CPU 重建已通过，
+  最终网格包含 358,550 个顶点和 594,769 个三角形
+- Azure Kinect 与 D435/D435i 真机采集：Linux 保留原实现；Windows x64 已接入原生
+  K4A/librealsense 后端；macOS 的 Azure 实时采集因官方 SDK 不支持而明确禁用
+
+2026-09-05 在当前 Windows 11 + WSL2（Ubuntu 20.04）设备上的验证结果：两端的
+`doctor`、四阶段合成 RGB-D 重建及后台服务完整生命周期均通过；WSL2 单元测试为
+66/66，Windows 为 65 项通过、1 项依赖 PyTorch 的 GPU 测试按设计跳过。本机没有
+NVIDIA GPU，也没有接入 Azure Kinect/D435/D435i，因此本次结论覆盖 CPU 软件链路与
+相机 SDK 加载，不冒充真机采集或 GPU 验证。
 
 平台能力如下：
 
-| 功能 | Linux x86_64 | macOS arm64/x86_64 |
-| --- | --- | --- |
-| Open3D 重建 / Web 控制台 | 支持 | 支持 |
-| 连续帧 RGB-D 里程计 GPU 加速 | NVIDIA CUDA | Apple Metal/MPS（M 系列） |
-| Azure Kinect 已有 MKV | K4A 原生读取 | FFmpeg 标定后端 |
-| Azure Kinect 实时预览与录制 | 支持 | 官方 SDK 不支持 |
-| RealSense 已有 BAG | 支持 | 支持 |
-| RealSense 实时预览与录制 | 支持 | 上游实验性支持，取决于设备与 USB 权限 |
+| 功能 | Windows x64 | Linux / WSL2 x86_64 | macOS arm64/x86_64 |
+| --- | --- | --- | --- |
+| Open3D 重建 / Web 控制台 | 支持 | 支持 | 支持 |
+| 连续帧 RGB-D 里程计 GPU 加速 | CPU | NVIDIA CUDA | Apple Metal/MPS（M 系列） |
+| Azure Kinect 已有 MKV | K4A 原生读取 | Linux 原生；WSL2 使用 FFmpeg 标定后端 | FFmpeg 标定后端 |
+| Azure Kinect 实时预览与录制 | 支持 | 支持；WSL2 需 USB 转接 | 官方 SDK 不支持 |
+| RealSense 已有 BAG | 支持 | 支持 | 支持 |
+| RealSense 实时预览与录制 | 支持 | 支持；WSL2 需 USB 转接 | 上游实验性支持 |
+
+## Windows x64 快速开始
+
+Windows 原生环境必须放在本机 NTFS 路径，例如
+`C:\src\open3d-reconstruct-system`。不要从 `\\wsl.localhost\...` UNC 路径运行
+Windows 安装器：Windows `uv` 的文件锁和虚拟环境在 WSL 文件服务器上不可靠。
+建议为 Windows 与 WSL2 各保留一份工作副本。
+
+在 Windows PowerShell 5.1 或更高版本中运行：
+
+```powershell
+Set-Location C:\src\open3d-reconstruct-system
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1
+.\open3d-reconstruct.ps1 doctor
+.\open3d-reconstruct.ps1 self-test
+```
+
+`setup.ps1` 会下载并校验项目内的 Windows `uv`、CPython 3.12、固定版本依赖和
+Azure Kinect 1.4.1 运行库，不依赖系统 Python。已有完整缓存时可用
+`.\setup.ps1 -Offline`。也可以从 `cmd.exe` 使用
+`open3d-reconstruct.cmd`；后续文档中的 `./open3d-reconstruct` 在 Windows 下均可替换为
+`.\open3d-reconstruct.ps1`。
+
+Windows 后台服务入口为：
+
+```powershell
+.\start-service.cmd
+.\status-service.cmd
+.\stop-service.cmd
+```
+
+## WSL2 快速开始
+
+在 WSL2 的 Ubuntu 终端中，它与普通 Linux 使用相同入口：
+
+```bash
+./setup.sh
+./open3d-reconstruct doctor
+./open3d-reconstruct self-test
+```
+
+Windows 浏览器可直接访问 WSL2 服务的
+[http://127.0.0.1:11920](http://127.0.0.1:11920)。相机 USB 不会仅因安装 WSL2 就自动
+出现在 Linux 中；需要先在 Windows 侧完成 USB 转接，再在 WSL2 中安装 udev 规则并以
+`doctor --camera all --require-device` 确认。若更重视相机即插即用，可直接使用上面的
+Windows 原生环境；若使用 NVIDIA 加速，则先确认 WSL2 内的 `nvidia-smi` 可用。
+WSL2 Web 控制台会调用 Windows 原生文件选择窗口，并自动转换 Windows/WSL 路径，
+无需安装 Zenity。Azure Kinect MKV 会自动使用项目 Python 环境内的静态 FFmpeg 做
+软件标定对齐，无需安装系统 FFmpeg，也不会调用 WSL2 中不稳定的 K4A OpenGL 变换引擎。
 
 ## macOS 快速开始
 
@@ -75,23 +136,25 @@ brew install ffmpeg
 
 所有应用依赖都位于当前项目：
 
-| 内容 | 目录 |
-| --- | --- |
-| CPython 3.12 | `.python/` |
-| Python 虚拟环境和全部 Python 包 | `.venv/` |
-| Azure Kinect SDK 与深度引擎（仅 Linux） | `.deps/k4a/` |
-| `uv` | `.tools/` |
-| 下载及运行缓存 | `.cache/` |
-| 录制和重建数据 | `data/` |
+| 内容 | Linux/macOS/WSL2 | Windows 原生 |
+| --- | --- | --- |
+| CPython 3.12 | `.python/` | `.python-windows/` |
+| Python 虚拟环境和全部 Python 包 | `.venv/` | `.venv-windows/` |
+| Azure Kinect SDK 与深度引擎 | `.deps/k4a/`（Linux/WSL2） | `.deps/k4a-windows/` |
+| `uv` | `.tools/` | `.tools-windows/` |
+| 服务运行状态 | `.run/` | `.run/windows/` |
+| 下载及运行缓存 | `.cache/` | `.cache/` 内的 Windows 专用子目录 |
+| 录制和重建数据 | `data/` | `data/` |
 
-RealSense 的 librealsense 已静态集成在 `.venv` 内的 Open3D wheel 中，不会读取
+RealSense 的 librealsense 已静态集成在对应虚拟环境的 Open3D wheel 中，不会读取
 系统安装的 librealsense。启动器使用 Python isolated mode，并清除外部
 `PYTHONPATH`，避免 ROS、Conda 和用户 site-packages 混入。
 
 操作系统内核、USB 与图形栈属于系统基础设施。Linux 的 udev 规则必须从
 `/etc/udev/rules.d/` 读取，因此非 root 访问相机时可能需要一次显式的
-`udev-install`。macOS 不使用 udev；FFmpeg 由 Homebrew 安装在项目外，Python 与
-Python 包仍保持项目内隔离。
+`udev-install`。Windows/macOS 不使用 udev；FFmpeg 由 Homebrew 安装在项目外，
+Python 与 Python 包仍保持项目内隔离。Windows 相机驱动与 WSL2 的 USB 转接属于系统
+基础设施，不由项目安装器静默修改。
 
 ## Web 可视化控制台
 
@@ -100,6 +163,9 @@ Python 包仍保持项目内隔离。
 ```bash
 ./start-service.sh
 ```
+
+Windows 使用 `.\start-service.cmd`；对应的状态与停止入口是
+`.\status-service.cmd`、`.\stop-service.cmd`。
 
 脚本返回“启动成功”后访问
 [http://127.0.0.1:11920](http://127.0.0.1:11920)。重复执行启动脚本是安全的：程序会
@@ -132,6 +198,8 @@ MKV/BAG 后退出。为保护录制文件，超时后脚本只报告错误，不
 .run/web.log
 ```
 
+Windows 使用隔离的 `.run/windows/` 子目录，文件名相同。
+
 需要前台运行以便调试时，也可以使用：
 
 ```bash
@@ -139,8 +207,8 @@ MKV/BAG 后退出。为保护录制文件，超时后脚本只报告错误，不
 ```
 
 前台命令使用同一把进程锁，因此后台服务存在时也不会重复启动。它会自动打开浏览器。
-macOS 上“打开本地录制”和“加载其他点云”使用系统原生文件选择窗口；Linux 使用
-Zenity。由于 Azure Kinect 官方 Sensor SDK 没有 macOS 后端，macOS 页面中应通过
+Windows、WSL2 与 macOS 上“打开本地录制”和“加载其他点云”使用系统原生文件选择窗口；
+普通 Linux 使用 Zenity。由于 Azure Kinect 官方 Sensor SDK 没有 macOS 后端，macOS 页面中应通过
 “打开本地录制”载入已有 MKV，而不是连接 Azure 相机。
 
 页面中的操作顺序为：
@@ -153,7 +221,9 @@ Zenity。由于 Azure Kinect 官方 Sensor SDK 没有 macOS 后端，macOS 页�
    温度、IMU 采样率和实时三维姿态轴；扫描场景后点击“结束录制”，页面会等待 MKV/BAG
    安全封装。也可以不连接相机，点击“打开本地录制”，通过桌面文件选择器选择磁盘上的
    MKV/BAG。项目会在 `data/recordings/` 优先建立硬链接，跨磁盘时改用符号引用，不再
-   上传或复制整段视频；完成后直接进入重建参数确认。
+   上传或复制整段视频；完成后直接进入重建参数确认。Windows 普通用户创建跨卷文件
+   符号链接需要开启“开发人员模式”；未开启时请把录像放到项目所在 NTFS 卷，或通过
+   页面上传导入。
 3. 点击“开始重建”会先弹出参数确认窗口，可选择速度优先、均衡或质量优先，也可分别
    调整帧采样、配准体素、深度范围、全局配准、片段长度、关键帧间隔、ICP 方法、
    深度差阈值、TSDF 融合体素、SDF 截断距离及片内/片段回环偏好。
@@ -216,10 +286,10 @@ D435/D435i 应直接连接 USB 3.x 端口。接入后运行：
 ./open3d-reconstruct udev-install --camera realsense
 ```
 
-该步骤仅适用于 Linux：命令会明确调用 `sudo`，安装项目内的
-`config/99-realsense-libusb.rules`。安装后重新插拔相机，再运行诊断。macOS 不使用
-udev，执行该命令只会给出说明而不会修改系统；若设备已接入但 SDK 仍枚举不到，请参考
-librealsense 的 macOS USB 权限限制，或先使用已有 BAG 做离线重建。
+该步骤仅适用于 Linux（包括已完成 USB 转接的 WSL2）：命令会明确调用 `sudo`，安装
+项目内的 `config/99-realsense-libusb.rules`。安装后重新插拔或重新转接相机，再运行
+诊断。Windows/macOS 不使用 udev，执行该命令只会给出说明而不会修改系统；Windows
+应检查设备管理器与驱动，macOS 若 SDK 仍枚举不到设备，可先使用已有 BAG 做离线重建。
 
 列出设备能力并预览：
 
@@ -310,9 +380,10 @@ data/datasets/first-scan/run-report.json
 
 ### GPU 计算后端
 
-重建默认使用 `auto`：Linux 检测 NVIDIA CUDA，Apple Silicon macOS 检测 Metal/MPS；
-没有可用 GPU、PyTorch 无法加载，或 GPU 里程计在运行中报错时，会自动改用原有的
-Open3D CPU 里程计。Intel Mac 也会直接走 CPU。可通过 `doctor` 查看最终选择：
+重建默认使用 `auto`：Linux/WSL2 检测 NVIDIA CUDA，Apple Silicon macOS 检测
+Metal/MPS；没有可用 GPU、PyTorch 无法加载，或 GPU 里程计在运行中报错时，会自动
+改用原有的 Open3D CPU 里程计。Windows 原生环境和 Intel Mac 直接走 CPU；Windows
+如需 NVIDIA 加速，建议使用支持 CUDA 转接的 WSL2 环境。可通过 `doctor` 查看最终选择：
 
 ```bash
 ./open3d-reconstruct doctor
@@ -347,7 +418,8 @@ GPU 路径使用同一套 Torch 张量实现，在 CUDA 与 MPS 上执行 Open3D
 
 ## Azure Kinect
 
-Linux 上为兼容已有用法，采集命令不指定 `--camera` 时仍默认 Azure Kinect：
+Linux/WSL2/Windows 上为兼容已有用法，采集命令不指定 `--camera` 时仍默认 Azure
+Kinect：
 
 ```bash
 ./open3d-reconstruct doctor --camera azure-kinect --require-device
@@ -361,8 +433,10 @@ Linux 上为兼容已有用法，采集命令不指定 `--camera` 时仍默认 A
 ./open3d-reconstruct udev-install --camera azure-kinect
 ```
 
-`udev-install` 不指定相机时会安装 Azure Kinect 和 RealSense 两套规则。这些实时采集和
-udev 命令仅适用于 Linux x86_64。
+`udev-install` 不指定相机时会安装 Azure Kinect 和 RealSense 两套规则；它只适用于
+Linux x86_64（包括 WSL2）。Windows x64 的实时采集使用项目内 K4A DLL 和 Windows
+原生 USB 后端，不使用 udev；若接入设备后诊断仍无法枚举，请检查官方设备驱动和设备
+管理器状态。
 
 Azure Kinect Sensor SDK 官方没有 macOS 运行时，Open3D 的 macOS wheel 也以
 `BUILD_AZURE_KINECT=OFF` 构建。因此 macOS 不伪装实时支持：`list`、`preview`、
@@ -447,11 +521,19 @@ Reconstruction System 仍只使用 RGB-D；当前版本不把 IMU 融入相机�
 ./.venv/bin/python -B -I -m unittest discover -s tests -v
 ```
 
+Windows 对应命令为：
+
+```powershell
+.\.venv-windows\Scripts\python.exe -B -I -X utf8 -m unittest discover -s tests -v
+```
+
 离线自检会创建 6 帧合成 RGB-D 数据并实际跑完四阶段重建：
 
 ```bash
 ./open3d-reconstruct self-test
 ```
+
+Windows 使用 `.\open3d-reconstruct.ps1 self-test`。
 
 若真机采集不稳定，请检查：
 
@@ -467,8 +549,8 @@ Reconstruction System 仍只使用 RGB-D；当前版本不把 IMU 融入相机�
 ## 上游与许可
 
 - [Open3D 0.19.0](https://github.com/isl-org/Open3D/tree/v0.19.0) 及其
-  Reconstruction System 使用 MIT License；官方 0.19 wheel 提供 macOS universal2 / Apple
-  Silicon 支持。
+  Reconstruction System 使用 MIT License；官方 0.19 wheel 提供 Windows/Linux x86_64
+  与 macOS universal2 / Apple Silicon 支持。
 - Open3D 0.19.0 wheel 以 `BUILD_LIBREALSENSE=ON` 集成
   [librealsense v2.44.0](https://github.com/IntelRealSense/librealsense/tree/v2.44.0)，
   使用 Apache License 2.0。macOS 实时 USB 的上游限制见

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import platform
 import plistlib
@@ -12,17 +13,22 @@ from pathlib import Path
 from typing import Iterable
 
 from .compute import resolve_compute_backend
+from .native import load_library
 from .paths import (
     AZURE_UDEV_RULE,
     IS_LINUX,
     IS_MACOS,
+    IS_WINDOWS,
+    IS_WSL,
     K4A_CORE_LIBRARY,
     K4A_DEPTH_ENGINE_LIBRARY,
     K4A_LIVE_SUPPORTED,
     K4A_RECORD_LIBRARY,
+    PYTHON_RUNTIME_DIR,
     REALSENSE_UDEV_RULE,
     ROOT,
     SUPPORTED_PLATFORM,
+    VENV_DIR,
 )
 from .realsense import device_model, is_supported_device_name
 
@@ -59,6 +65,8 @@ def _find_usb_devices(
 ) -> list[dict[str, object]]:
     if IS_MACOS:
         return _find_macos_usb_devices(vendor=vendor, products=products)
+    if IS_WINDOWS:
+        return _find_windows_usb_devices(vendor=vendor, products=products)
     devices: list[dict[str, object]] = []
     sysfs = Path("/sys/bus/usb/devices")
     if not sysfs.is_dir():
@@ -89,6 +97,67 @@ def _find_usb_devices(
             }
         )
     return devices
+
+
+def _find_windows_usb_devices(
+    *, vendor: str, products: set[str]
+) -> list[dict[str, object]]:
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if powershell is None:
+        return []
+    environment = os.environ.copy()
+    environment["OPEN3D_RECONSTRUCT_USB_VENDOR"] = vendor.upper()
+    environment["OPEN3D_RECONSTRUCT_USB_PRODUCTS"] = ",".join(
+        sorted(item.upper() for item in products)
+    )
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$vendor = [Regex]::Escape($env:OPEN3D_RECONSTRUCT_USB_VENDOR)
+$products = @($env:OPEN3D_RECONSTRUCT_USB_PRODUCTS -split ',' | ForEach-Object { [Regex]::Escape($_) })
+$pattern = 'VID_' + $vendor + '&PID_(' + ($products -join '|') + ')'
+$items = @(Get-PnpDevice -PresentOnly -ErrorAction Stop |
+    Where-Object { $_.InstanceId -match $pattern } |
+    ForEach-Object {
+        $match = [Regex]::Match($_.InstanceId, 'PID_([0-9A-Fa-f]{4})')
+        [PSCustomObject]@{
+            product = $match.Groups[1].Value.ToLowerInvariant()
+            name = $_.FriendlyName
+            status = [string]$_.Status
+        }
+    })
+ConvertTo-Json -Compress -InputObject $items
+""".strip()
+    try:
+        result = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8-sig",
+            errors="replace",
+            env=environment,
+            check=False,
+            timeout=8,
+        )
+        values = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return [
+        {
+            "product": str(item.get("product", "")).lower(),
+            "name": item.get("name"),
+            "node": None,
+            "speed": None,
+            "readable": item.get("status") == "OK",
+            "writable": item.get("status") == "OK",
+        }
+        for item in values
+        if isinstance(item, dict)
+    ]
 
 
 def _find_macos_usb_devices(
@@ -167,11 +236,11 @@ def _load_k4a() -> tuple[ctypes.CDLL | None, str | None]:
     if not K4A_LIVE_SUPPORTED:
         return (
             None,
-            "Azure Kinect 官方 Sensor SDK 仅支持 Linux/Windows；macOS 仅支持离线 MKV",
+            "Azure Kinect 官方 Sensor SDK 仅支持 Linux/Windows；当前平台仅支持离线 MKV",
         )
     library = K4A_CORE_LIBRARY
     try:
-        return ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL), None
+        return load_library(library), None
     except OSError as exc:
         return None, str(exc)
 
@@ -186,7 +255,7 @@ def _installed_device_count(library: ctypes.CDLL) -> int:
 def k4a_device_count() -> int:
     if not K4A_LIVE_SUPPORTED:
         raise RuntimeError(
-            "Azure Kinect 实时采集在 macOS 上不可用；"
+            "Azure Kinect 实时采集在当前平台不可用；"
             "已有 MKV 可继续离线提取和重建"
         )
     library, error = _load_k4a()
@@ -205,8 +274,8 @@ def _base_checks() -> tuple[list[Check], object | None]:
         )
     )
 
-    python_local = _inside(Path(sys.prefix), ROOT / ".venv") and _inside(
-        Path(sys.base_prefix), ROOT / ".python"
+    python_local = _inside(Path(sys.prefix), VENV_DIR) and _inside(
+        Path(sys.base_prefix), PYTHON_RUNTIME_DIR
     )
     version_ok = sys.version_info[:2] == (3, 12)
     checks.append(
@@ -237,9 +306,7 @@ def _base_checks() -> tuple[list[Check], object | None]:
         import open3d as o3d
 
         module_path = Path(o3d.__file__).resolve()
-        open3d_ok = o3d.__version__ == "0.19.0" and _inside(
-            module_path, ROOT / ".venv"
-        )
+        open3d_ok = o3d.__version__ == "0.19.0" and _inside(module_path, VENV_DIR)
         checks.append(
             Check(
                 "ok" if open3d_ok else "fail",
@@ -304,7 +371,12 @@ def _usb_camera_checks(
                 item["readable"] and item["writable"]
             )
         speed_ok = speed_ok and bool(speed is None or float(speed) >= 5000)
-        location = str(node) if node is not None else "macOS IORegistry"
+        if node is not None:
+            location = str(node)
+        elif IS_WINDOWS:
+            location = "Windows PnP"
+        else:
+            location = "macOS IORegistry"
         descriptions.append(f"{name} @ {location}，{speed or '?'} Mb/s")
     checks = [
         Check("ok", f"[{label}] USB 设备", "; ".join(descriptions)),
@@ -344,24 +416,33 @@ def _azure_checks(o3d: object | None, *, require_device: bool) -> tuple[list[Che
             )
         )
     )
-    if not K4A_LIVE_SUPPORTED:
-        ffmpeg = shutil.which("ffmpeg")
-        ffprobe = shutil.which("ffprobe")
-        portable_ready = bool(ffmpeg and ffprobe)
+    if not K4A_LIVE_SUPPORTED or IS_WSL:
+        try:
+            from .mkv_portable import _tools as portable_mkv_tools
+
+            _ffmpeg, ffprobe = portable_mkv_tools()
+            portable_ready = True
+            portable_detail = (
+                "FFmpeg/ffprobe 标定提取后端可用"
+                if ffprobe
+                else "项目内静态 FFmpeg 标定提取后端可用"
+            )
+        except RuntimeError as exc:
+            portable_ready = False
+            portable_detail = str(exc)
         checks.append(
             Check(
                 "ok" if portable_ready else "fail",
                 "[Azure] MKV 离线",
-                "FFmpeg 标定提取后端可用"
-                if portable_ready
-                else "缺少 ffmpeg/ffprobe；请运行 brew install ffmpeg",
+                portable_detail,
             )
         )
+    if not K4A_LIVE_SUPPORTED:
         checks.append(
             Check(
                 "fail" if require_device else "warn",
                 "[Azure] 实时采集",
-                "Azure Kinect Sensor SDK 不支持 macOS；已有 MKV 可正常重建",
+                "Azure Kinect Sensor SDK 不支持当前平台；已有 MKV 可正常重建",
             )
         )
         cameras = find_k4a_usb_devices()
@@ -370,7 +451,7 @@ def _azure_checks(o3d: object | None, *, require_device: bool) -> tuple[list[Che
                 Check(
                     "warn",
                     "[Azure] USB 设备",
-                    "macOS 已检测到 Azure Kinect，但官方 SDK 无法在本平台采集",
+                    "已检测到 Azure Kinect，但官方 SDK 无法在本平台采集",
                 )
             )
         return checks, 0
@@ -412,7 +493,7 @@ def _azure_checks(o3d: object | None, *, require_device: bool) -> tuple[list[Che
             ("depth", K4A_DEPTH_ENGINE_LIBRARY),
         ):
             try:
-                ctypes.CDLL(str(path))
+                load_library(path)
             except OSError as exc:
                 auxiliary_errors.append(f"{label}: {exc}")
     checks.append(
@@ -449,11 +530,12 @@ def _azure_checks(o3d: object | None, *, require_device: bool) -> tuple[list[Che
             )
         except Exception as exc:
             checks.append(Check("fail", "[Azure] SDK 枚举", str(exc)))
-    checks.append(
-        _rule_check(
-            "Azure", AZURE_UDEV_RULE, Path("/etc/udev/rules.d/99-k4a.rules")
+    if IS_LINUX:
+        checks.append(
+            _rule_check(
+                "Azure", AZURE_UDEV_RULE, Path("/etc/udev/rules.d/99-k4a.rules")
+            )
         )
-    )
     return checks, count
 
 
@@ -482,7 +564,7 @@ def _realsense_checks(
         Check(
             "ok" if realsense_api else "fail",
             "[RealSense] 本地运行库",
-            "librealsense 已静态集成在项目 .venv 的 Open3D wheel 中"
+            f"librealsense 已静态集成在项目 {VENV_DIR.name} 的 Open3D wheel 中"
             if realsense_api
             else "不可用",
         )
@@ -548,12 +630,20 @@ def _realsense_checks(
                 Path("/etc/udev/rules.d/99-realsense-libusb.rules"),
             )
         )
-    else:
+    elif IS_MACOS:
         checks.append(
             Check(
                 "warn",
                 "[RealSense] macOS USB",
                 "macOS 12+ 可能要求以 sudo 运行实时采集；BAG 离线重建不受影响",
+            )
+        )
+    elif IS_WINDOWS:
+        checks.append(
+            Check(
+                "ok",
+                "[RealSense] Windows USB",
+                "使用 Windows 原生 USB 后端；设备可用性由 SDK 枚举结果确认",
             )
         )
     return checks, len(supported)

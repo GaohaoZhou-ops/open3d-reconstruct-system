@@ -20,6 +20,7 @@ K4A_LIB_DIR="$K4A_ROOT/usr/lib/x86_64-linux-gnu"
 usage() {
     echo "用法: ./setup.sh [--offline]"
     echo "  支持 Linux x86_64 与 macOS Intel/Apple Silicon。"
+    echo '  Windows x64 请在本机 NTFS 工作副本中运行：.\setup.ps1'
     echo "  默认下载并安装 Python 依赖到当前项目；--offline 只使用已有缓存。"
 }
 
@@ -38,6 +39,7 @@ elif [[ "$SYSTEM_NAME" == "Darwin" \
     PLATFORM="macos-$MACHINE_NAME"
 else
     echo "不支持的平台: $SYSTEM_NAME ${MACHINE_NAME}（支持 Linux x86_64 与 macOS arm64/x86_64）。" >&2
+    echo 'Windows x64 请改用 Windows PowerShell：.\setup.ps1' >&2
     exit 1
 fi
 
@@ -169,13 +171,13 @@ if [[ ! -f "$PROJECT_ROOT/uv.lock" ]]; then
         echo "离线模式下缺少 uv.lock" >&2
         exit 1
     fi
-    run_online_uv "$UV_BIN" lock
+    run_online_uv "$UV_BIN" lock --project "$PROJECT_ROOT"
 fi
 
 if [[ "$OFFLINE" == "1" ]]; then
-    "$UV_BIN" sync --frozen --offline
+    "$UV_BIN" sync --project "$PROJECT_ROOT" --frozen --offline
 else
-    run_online_uv "$UV_BIN" sync --frozen
+    run_online_uv "$UV_BIN" sync --project "$PROJECT_ROOT" --frozen
 fi
 
 chmod +x "$PROJECT_ROOT/open3d-reconstruct" "$PROJECT_ROOT/setup.sh"

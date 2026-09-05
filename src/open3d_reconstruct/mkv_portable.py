@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -57,12 +59,20 @@ class CameraCalibration:
     translation_mm: Any
 
 
-def _tools() -> tuple[str, str]:
+def _tools() -> tuple[str, str | None]:
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
+    if not ffmpeg:
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+
+            ffmpeg = get_ffmpeg_exe()
+        except (ImportError, OSError, RuntimeError):
+            ffmpeg = None
+    if not ffmpeg:
         raise RuntimeError(
-            "便携式 Azure Kinect MKV 提取需要 FFmpeg；macOS 可运行 brew install ffmpeg"
+            "便携式 Azure Kinect MKV 提取需要 FFmpeg；请重新运行项目安装器，"
+            "macOS 也可运行 brew install ffmpeg"
         )
     return ffmpeg, ffprobe
 
@@ -98,24 +108,9 @@ def _stream_is(stream: dict[str, Any], kind: str) -> bool:
     return title == kind.upper() or f"K4A_{kind.upper()}_TRACK" in tags
 
 
-def probe_mkv(source: Path, ffprobe: str) -> MKVProbe:
-    value = _run_json(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            str(source),
-        ],
-        description="读取 MKV 流信息",
-    )
-    streams = value.get("streams")
-    if not isinstance(streams, list):
-        raise RuntimeError("MKV 中没有流信息")
-
+def _build_probe(
+    streams: list[dict[str, Any]], tags: dict[str, str]
+) -> MKVProbe:
     def find(kind: str) -> VideoStream:
         for item in streams:
             if not isinstance(item, dict) or not _stream_is(item, kind):
@@ -133,6 +128,98 @@ def probe_mkv(source: Path, ffprobe: str) -> MKVProbe:
             return stream
         raise RuntimeError(f"MKV 中缺少 Azure Kinect {kind} 流")
 
+    return MKVProbe(color=find("color"), depth=find("depth"), tags=tags)
+
+
+_FFMPEG_VIDEO_STREAM = re.compile(
+    r"^\s*Stream #\d+:(?P<index>\d+)(?:\[[^]]+\])?(?:\([^)]*\))?:\s+Video:.*?"
+    r"(?P<width>\d{2,5})x(?P<height>\d{2,5})(?:[,\s])"
+)
+_FFMPEG_METADATA = re.compile(r"^\s*(?P<key>[A-Za-z0-9_]+)\s*:\s*(?P<value>.*?)\s*$")
+
+
+def _probe_mkv_with_ffmpeg(source: Path, ffmpeg: str) -> MKVProbe:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostdin", "-i", str(source)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"无法读取 MKV 流信息: {exc}") from exc
+
+    streams: list[dict[str, Any]] = []
+    tags: dict[str, str] = {}
+    current: dict[str, Any] | None = None
+    for line in result.stderr.splitlines():
+        stream_match = _FFMPEG_VIDEO_STREAM.match(line)
+        if stream_match:
+            current = {
+                "index": int(stream_match.group("index")),
+                "width": int(stream_match.group("width")),
+                "height": int(stream_match.group("height")),
+                "tags": {},
+            }
+            streams.append(current)
+            continue
+        if line.lstrip().startswith("Stream #"):
+            current = None
+            continue
+        metadata_match = _FFMPEG_METADATA.match(line)
+        if not metadata_match:
+            continue
+        key = metadata_match.group("key")
+        value = metadata_match.group("value")
+        if not value:
+            continue
+        if current is None:
+            tags[key] = value
+        else:
+            current["tags"][key] = value
+
+    for stream in streams:
+        tags.update(stream["tags"])
+    try:
+        return _build_probe(streams, tags)
+    except RuntimeError as exc:
+        detail = result.stderr.strip()
+        if not streams and detail:
+            raise RuntimeError(f"无法读取 MKV 流信息: {detail}") from exc
+        raise
+
+
+def probe_mkv(
+    source: Path, ffprobe: str | None, *, ffmpeg: str | None = None
+) -> MKVProbe:
+    if ffprobe is None:
+        if ffmpeg is None:
+            raise RuntimeError("读取 MKV 流信息需要 ffprobe 或 ffmpeg")
+        return _probe_mkv_with_ffmpeg(source, ffmpeg)
+    value = _run_json(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(source),
+        ],
+        description="读取 MKV 流信息",
+    )
+    streams = value.get("streams")
+    if not isinstance(streams, list):
+        raise RuntimeError("MKV 中没有流信息")
+
     format_value = value.get("format")
     raw_tags = format_value.get("tags", {}) if isinstance(format_value, dict) else {}
     tags: dict[str, str] = (
@@ -146,7 +233,7 @@ def probe_mkv(source: Path, ffprobe: str) -> MKVProbe:
         if not isinstance(stream, dict) or not isinstance(stream.get("tags"), dict):
             continue
         tags.update({str(key): str(item) for key, item in stream["tags"].items()})
-    return MKVProbe(color=find("color"), depth=find("depth"), tags=tags)
+    return _build_probe(streams, tags)
 
 
 def read_calibration(source: Path, ffmpeg: str) -> dict[str, Any]:
@@ -510,7 +597,7 @@ def extract_mkv_portable(
     (partial / "color").mkdir()
     (partial / "depth").mkdir()
 
-    probe = probe_mkv(workspace.source, ffprobe)
+    probe = probe_mkv(workspace.source, ffprobe, ffmpeg=ffmpeg)
     calibration_json = read_calibration(workspace.source, ffmpeg)
     depth_camera = mode_specific_calibration(
         _camera_from_calibration(calibration_json, "Depth"),

@@ -6,7 +6,13 @@ from pathlib import Path
 
 from .configuration import read_json_object
 from .extraction import complete_extraction, prepare_extraction
-from .paths import DEFAULT_SENSOR_CONFIG, K4A_LIVE_SUPPORTED, RECORDINGS_DIR, SYSTEM
+from .paths import (
+    DEFAULT_SENSOR_CONFIG,
+    IS_WSL,
+    K4A_LIVE_SUPPORTED,
+    RECORDINGS_DIR,
+    SYSTEM,
+)
 
 
 RECORDING_EXTENSION = ".mkv"
@@ -16,7 +22,7 @@ def _require_live_capture() -> None:
     if not K4A_LIVE_SUPPORTED:
         raise RuntimeError(
             f"Azure Kinect 实时采集不支持 {SYSTEM}；macOS 可提取和重建已有 MKV，"
-            "实时采集请继续使用 Linux x86_64"
+            "实时采集请使用 Linux 或 Windows x64"
         )
 
 
@@ -266,7 +272,11 @@ def extract_mkv(
     force: bool = False,
     stride: int = 1,
 ) -> Path:
-    if not K4A_LIVE_SUPPORTED:
+    # The K4A transform engine requires an OpenGL 4.4 context. WSL2 can still
+    # record raw MKV streams through USB forwarding, but its graphics bridge
+    # does not reliably satisfy that offline depth-alignment requirement. Use
+    # the calibration-based software extractor that is also used on macOS.
+    if not K4A_LIVE_SUPPORTED or IS_WSL:
         from .mkv_portable import extract_mkv_portable
 
         return extract_mkv_portable(

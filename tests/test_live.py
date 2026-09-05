@@ -19,6 +19,13 @@ from open3d_reconstruct.live import LivePreviewPublisher
 
 
 class LivePreviewTests(unittest.TestCase):
+    def test_stop_request_created_before_backend_start_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "stop.requested").touch()
+            publisher = LivePreviewPublisher(directory, hardware="d435")
+            self.assertTrue(publisher.stop_requested)
+
     def test_rgb_depth_and_imu_are_published_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

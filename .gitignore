@@ -2,6 +2,9 @@
 /.venv/
 /.python/
 /.tools/
+/.venv-windows/
+/.python-windows/
+/.tools-windows/
 /.deps/
 
 # Runtime state and caches

@@ -8,6 +8,7 @@ from typing import Any
 
 from .configuration import read_json_object
 from .live import LivePreviewPublisher
+from .native import load_library
 from .paths import (
     DEFAULT_AZURE_SENSOR_CONFIG,
     K4A_CORE_LIBRARY,
@@ -133,15 +134,15 @@ class K4ALibraries:
     def __init__(self) -> None:
         if not K4A_LIVE_SUPPORTED:
             raise RuntimeError(
-                "Azure Kinect 实时采集需要官方 K4A SDK，当前仅支持 Linux x86_64；"
+                "Azure Kinect 实时采集需要官方 K4A SDK，当前支持 Linux/Windows x64；"
                 "macOS 可以离线提取和重建已有 MKV"
             )
         core_path = K4A_CORE_LIBRARY
         record_path = K4A_RECORD_LIBRARY
         if not core_path.exists() or not record_path.exists():
             raise RuntimeError("项目内 Azure Kinect SDK 运行库不完整")
-        self.core = ctypes.CDLL(str(core_path), mode=ctypes.RTLD_GLOBAL)
-        self.record = ctypes.CDLL(str(record_path), mode=ctypes.RTLD_GLOBAL)
+        self.core = load_library(core_path)
+        self.record = load_library(record_path)
         self._bind()
 
     def _bind(self) -> None:
@@ -439,6 +440,9 @@ def record_with_imu(
         duration_text = f"{seconds:g} 秒" if seconds is not None else "直到 Ctrl+C"
         print(f"开始 Web RGB-D + IMU 录制 {duration_text}。按 Ctrl+C 可保存退出。")
         while True:
+            if publisher.stop_requested:
+                print("收到 Web 安全停止请求，正在封装并保存 MKV……")
+                break
             if seconds is not None and time.monotonic() - started >= seconds:
                 break
             capture = ctypes.c_void_p()
@@ -446,6 +450,9 @@ def record_with_imu(
                 device_handle, ctypes.byref(capture), timeout_ms
             )
             if result == K4A_WAIT_RESULT_TIMEOUT:
+                if publisher.stop_requested:
+                    print("收到 Web 安全停止请求，正在封装并保存 MKV……")
+                    break
                 if time.monotonic() - last_frame > 10:
                     raise RuntimeError("录制期间连续 10 秒未收到 Azure Kinect RGB-D 帧")
                 continue

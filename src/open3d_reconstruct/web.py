@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -27,12 +27,19 @@ from .paths import (
     DATASETS_DIR,
     DEFAULT_AZURE_SENSOR_CONFIG,
     DEFAULT_REALSENSE_SENSOR_CONFIG,
+    IS_WSL,
     RECORDINGS_DIR,
     ROOT,
     RUNTIME_DIR,
     ensure_local_directories,
 )
-from .service import DEFAULT_SERVICE_PORT, SERVICE_NAME, SingletonLease
+from .service import (
+    DEFAULT_SERVICE_PORT,
+    SERVICE_NAME,
+    SingletonLease,
+    _format_command,
+    _launcher_prefix,
+)
 
 
 DEFAULT_WEB_PORT = DEFAULT_SERVICE_PORT
@@ -245,6 +252,51 @@ class WebActionError(RuntimeError):
         self.status = int(status)
 
 
+def _translate_wsl_path(value: str | Path, *, to_windows: bool) -> str:
+    converter = shutil.which("wslpath")
+    if converter is None:
+        raise WebActionError(
+            "WSL 缺少 wslpath，无法转换 Windows 文件路径",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    try:
+        result = subprocess.run(
+            [converter, "-w" if to_windows else "-u", str(value)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        raise WebActionError(
+            f"无法运行 WSL 路径转换器: {exc}",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        ) from exc
+    converted = result.stdout.strip()
+    if result.returncode != 0 or not converted:
+        detail = result.stderr.strip() or f"退出代码 {result.returncode}"
+        raise WebActionError(
+            f"无法转换所选文件路径: {detail}",
+            HTTPStatus.BAD_REQUEST,
+        )
+    return converted
+
+
+def _expose_picker_environment_to_windows(environment: dict[str, str]) -> None:
+    names = (
+        "OPEN3D_RECONSTRUCT_PICKER_TITLE",
+        "OPEN3D_RECONSTRUCT_PICKER_FILTER",
+        "OPEN3D_RECONSTRUCT_PICKER_INITIAL",
+    )
+    entries = [item for item in environment.get("WSLENV", "").split(":") if item]
+    exposed = {item.split("/", 1)[0] for item in entries}
+    entries.extend(f"{name}/w" for name in names if name not in exposed)
+    environment["WSLENV"] = ":".join(entries)
+
+
 def _native_file_picker(
     *,
     title: str,
@@ -252,7 +304,93 @@ def _native_file_picker(
     initial_directory: Path | None = None,
     allow_all: bool = False,
 ) -> str | None:
-    if sys.platform == "darwin":
+    picker_environment: dict[str, str] | None = None
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    use_wsl_picker = sys.platform == "linux" and IS_WSL and powershell is not None
+    if sys.platform == "win32" or use_wsl_picker:
+        picker = powershell
+        if picker is None:  # Native Windows must always have PowerShell available.
+            raise WebActionError(
+                "系统缺少 Windows PowerShell，无法打开本机文件选择窗口",
+                HTTPStatus.NOT_IMPLEMENTED,
+            )
+        normalized = tuple(item.lstrip(".").lower() for item in extensions)
+        if not normalized or any(not item.isalnum() for item in normalized):
+            raise ValueError("Windows 文件类型过滤器无效")
+        patterns = ";".join(f"*.{item}" for item in normalized)
+        label = "PLY 点云与网格" if normalized == ("ply",) else "录制文件"
+        filters = f"{label} ({patterns})|{patterns}"
+        if allow_all:
+            filters += "|所有文件 (*.*)|*.*"
+        script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$owner = $null
+$dialog = $null
+$exitCode = 2
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+
+    # Keep an invisible topmost owner alive for the lifetime of the common
+    # dialog. The dialog remains above the browser even if the browser takes
+    # focus again after handling the original button click.
+    $owner = [System.Windows.Forms.Form]::new()
+    $owner.Width = 1
+    $owner.Height = 1
+    $owner.Opacity = 0
+    $owner.ShowInTaskbar = $false
+    $owner.TopMost = $true
+    $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $owner.Show()
+    $owner.Activate()
+
+    $dialog = [System.Windows.Forms.OpenFileDialog]::new()
+    $dialog.Title = $env:OPEN3D_RECONSTRUCT_PICKER_TITLE
+    $dialog.Filter = $env:OPEN3D_RECONSTRUCT_PICKER_FILTER
+    $dialog.Multiselect = $false
+    if ($env:OPEN3D_RECONSTRUCT_PICKER_INITIAL) {
+        $dialog.InitialDirectory = $env:OPEN3D_RECONSTRUCT_PICKER_INITIAL
+    }
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        [Console]::WriteLine($dialog.FileName)
+        $exitCode = 0
+    }
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    $exitCode = 1
+}
+finally {
+    if ($null -ne $dialog) {
+        $dialog.Dispose()
+    }
+    if ($null -ne $owner) {
+        $owner.Close()
+        $owner.Dispose()
+    }
+}
+exit $exitCode
+""".strip()
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        command = [
+            picker,
+            "-NoLogo",
+            "-NoProfile",
+            "-STA",
+            "-EncodedCommand",
+            encoded,
+        ]
+        picker_environment = os.environ.copy()
+        picker_environment["OPEN3D_RECONSTRUCT_PICKER_TITLE"] = title
+        picker_environment["OPEN3D_RECONSTRUCT_PICKER_FILTER"] = filters
+        initial_value = str(initial_directory) if initial_directory is not None else ""
+        if use_wsl_picker and initial_value:
+            initial_value = _translate_wsl_path(initial_value, to_windows=True)
+        picker_environment["OPEN3D_RECONSTRUCT_PICKER_INITIAL"] = initial_value
+        if use_wsl_picker:
+            _expose_picker_environment_to_windows(picker_environment)
+        cancel_codes = {2}
+    elif sys.platform == "darwin":
         picker = shutil.which("osascript")
         if picker is None:
             raise WebActionError(
@@ -304,6 +442,9 @@ def _native_file_picker(
             command.append("--file-filter=所有文件 | *")
         cancel_codes = {1, 5}
     try:
+        run_options: dict[str, Any] = {}
+        if picker_environment is not None:
+            run_options["env"] = picker_environment
         result = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
@@ -313,13 +454,14 @@ def _native_file_picker(
             encoding="utf-8",
             errors="replace",
             check=False,
+            **run_options,
         )
     except OSError as exc:
         raise WebActionError(
             f"无法打开本机文件选择窗口: {exc}",
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ) from exc
-    if result.returncode in cancel_codes or not result.stdout.strip():
+    if result.returncode in cancel_codes:
         return None
     if result.returncode != 0:
         detail = result.stderr.strip() or f"退出代码 {result.returncode}"
@@ -327,7 +469,12 @@ def _native_file_picker(
             f"本机文件选择失败: {detail}",
             HTTPStatus.INTERNAL_SERVER_ERROR,
         )
-    return result.stdout.strip()
+    selected = result.stdout.strip()
+    if not selected:
+        return None
+    if use_wsl_picker:
+        return _translate_wsl_path(selected, to_windows=False)
+    return selected
 
 
 def _now_iso() -> str:
@@ -339,7 +486,7 @@ def _display_path(path: Path | None) -> str | None:
         return None
     absolute = Path(os.path.abspath(path))
     try:
-        return str(absolute.relative_to(ROOT.resolve()))
+        return absolute.relative_to(ROOT.resolve()).as_posix()
     except ValueError:
         return str(path.resolve())
 
@@ -596,7 +743,14 @@ class ControlCenter:
     """Owns the single local camera/conversion process used by the web page."""
 
     def __init__(self, launcher: Path | None = None) -> None:
-        self.launcher = (launcher or (ROOT / "open3d-reconstruct")).resolve()
+        prefix, invalid_launcher = _launcher_prefix(launcher)
+        self.launcher = (
+            launcher.expanduser().resolve()
+            if launcher is not None
+            else Path(sys.executable).resolve()
+        )
+        self._launcher_prefix = prefix
+        self._invalid_launcher = invalid_launcher
         self._lock = threading.RLock()
         self._device_lock = threading.Lock()
         self._file_picker_lock = threading.Lock()
@@ -1056,8 +1210,9 @@ class ControlCenter:
     ) -> None:
         if self._process is not None:
             raise WebActionError("已有任务正在运行，请等待它结束")
-        if not self.launcher.is_file() or not os.access(self.launcher, os.X_OK):
-            raise WebActionError(f"项目启动器不可执行: {self.launcher}", HTTPStatus.INTERNAL_SERVER_ERROR)
+        if self._invalid_launcher is not None or not self._launcher_prefix:
+            invalid = self._invalid_launcher or self.launcher
+            raise WebActionError(f"项目启动器不可执行: {invalid}", HTTPStatus.INTERNAL_SERVER_ERROR)
 
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
@@ -1065,8 +1220,13 @@ class ControlCenter:
             environment.update(environment_overrides)
         self._generation += 1
         generation = self._generation
-        self._append_log("$ " + shlex.join(command), level="command")
+        self._append_log("$ " + _format_command(command), level="command")
         try:
+            process_options: dict[str, Any] = {}
+            if os.name == "nt":
+                process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                process_options["start_new_session"] = True
             process = subprocess.Popen(
                 command,
                 cwd=ROOT,
@@ -1078,7 +1238,8 @@ class ControlCenter:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                start_new_session=True,
+                close_fds=True,
+                **process_options,
             )
         except OSError as exc:
             raise WebActionError(f"无法启动任务: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from exc
@@ -1452,10 +1613,16 @@ class ControlCenter:
                         managed.symlink_to(source)
                         mode = "symlink"
                     except OSError as symlink_error:
+                        hint = (
+                            "；Windows 跨卷零拷贝需要启用开发人员模式，"
+                            "或将录制文件放到项目所在的同一 NTFS 卷"
+                            if os.name == "nt"
+                            else ""
+                        )
                         raise WebActionError(
                             "无法建立录制文件零拷贝引用："
                             f"硬链接失败（{hardlink_error}）；"
-                            f"符号引用失败（{symlink_error}）",
+                            f"符号引用失败（{symlink_error}）{hint}",
                             HTTPStatus.INTERNAL_SERVER_ERROR,
                         ) from symlink_error
                 created = True
@@ -1649,7 +1816,7 @@ class ControlCenter:
             items.append(
                 {
                     "name": recording.name,
-                    "path": str(recording.absolute().relative_to(ROOT.resolve())),
+                    "path": recording.absolute().relative_to(ROOT.resolve()).as_posix(),
                     "hardware": (
                         "azure-kinect"
                         if recording.suffix.lower() == ".mkv"
@@ -1665,7 +1832,7 @@ class ControlCenter:
                     "can_use": exists and not busy,
                     "can_delete": not busy,
                     "dataset": {
-                        "path": str(dataset.absolute().relative_to(ROOT.resolve())),
+                        "path": dataset.absolute().relative_to(ROOT.resolve()).as_posix(),
                         "exists": bool(artifact_paths),
                         "size": output_size,
                         "has_preprocessed": any(
@@ -1825,7 +1992,7 @@ class ControlCenter:
             live_dir = self._prepare_live_dir_locked()
             self._touch_locked()
             command = [
-                str(self.launcher),
+                *self._launcher_prefix,
                 "record",
                 "--camera",
                 spec["camera"],
@@ -1859,11 +2026,26 @@ class ControlCenter:
     @staticmethod
     def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
         try:
-            os.killpg(process.pid, sig)
+            if os.name == "nt":
+                if sig in {signal.SIGINT, signal.SIGTERM}:
+                    process.terminate()
+                else:
+                    process.kill()
+            else:
+                os.killpg(process.pid, sig)
         except ProcessLookupError:
             return
-        except PermissionError as exc:
+        except (OSError, PermissionError) as exc:
             raise WebActionError(f"无法停止录制进程: {exc}") from exc
+
+    def _request_recording_stop_locked(self) -> None:
+        if self._live_dir is not None:
+            try:
+                (self._live_dir / "stop.requested").touch(exist_ok=True)
+            except OSError as exc:
+                raise WebActionError(f"无法请求录制进程安全停止: {exc}") from exc
+        if os.name != "nt" and self._process is not None:
+            self._signal_process_group(self._process, signal.SIGINT)
 
     def stop_recording(self) -> dict[str, Any]:
         with self._lock:
@@ -1874,7 +2056,7 @@ class ControlCenter:
                 return self._snapshot_locked()
             self._phase = "stopping"
             self._append_log("正在停止录制并封装文件，请稍候……", level="command")
-            self._signal_process_group(process, signal.SIGINT)
+            self._request_recording_stop_locked()
             generation = self._generation
             threading.Thread(
                 target=self._stop_watchdog,
@@ -1919,7 +2101,7 @@ class ControlCenter:
             assert self._recording is not None
             assert self._dataset is not None
             command = [
-                str(self.launcher),
+                *self._launcher_prefix,
                 "reconstruct",
                 str(self._recording),
                 "--dataset",
@@ -2504,7 +2686,12 @@ class ControlCenter:
             if process is None or process.poll() is not None:
                 return
             self._append_log("Web 服务正在退出，先停止当前子任务。", level="command")
-            self._signal_process_group(process, signal.SIGINT)
+            with self._lock:
+                recording = self._task == "record"
+                if recording:
+                    self._request_recording_stop_locked()
+            if not recording:
+                self._signal_process_group(process, signal.SIGINT)
             try:
                 process.wait(timeout=12)
                 return
@@ -2870,6 +3057,19 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 return
             parsed = urlsplit(self.path)
             try:
+                if parsed.path == "/api/service/shutdown":
+                    token = self.headers.get("X-Open3D-Reconstruct-Service", "")
+                    if not instance_id or token != instance_id:
+                        self._error(HTTPStatus.FORBIDDEN, "服务停止令牌无效")
+                        return
+                    self._read_json()
+                    self._send_json({"ok": True, "shutting_down": True})
+                    threading.Thread(
+                        target=self.server.shutdown,
+                        name="web-service-shutdown",
+                        daemon=True,
+                    ).start()
+                    return
                 if parsed.path == "/api/recording/import":
                     state = self._receive_recording_import(parsed)
                     self._send_json({"ok": True, "state": state})
