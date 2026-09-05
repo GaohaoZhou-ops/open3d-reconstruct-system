@@ -3,12 +3,176 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from open3d_reconstruct.extraction import (
     complete_extraction,
     prepare_extraction,
 )
 from open3d_reconstruct.paths import ROOT
+
+
+def _calibration_camera(
+    purpose: str,
+    *,
+    width: int,
+    height: int,
+    parameters: list[float] | None = None,
+) -> dict:
+    return {
+        "Purpose": purpose,
+        "SensorWidth": width,
+        "SensorHeight": height,
+        "MetricRadius": 1.7,
+        "Intrinsics": {
+            "ModelType": "CALIBRATION_LensDistortionModelBrownConrady",
+            "ModelParameters": parameters
+            or [0.5, 0.5, 0.5, 0.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        "Rt": {
+            "Rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+            "Translation": [0, 0, 0],
+        },
+    }
+
+
+class PortableMKVCalibrationTests(unittest.TestCase):
+    def test_mode_specific_intrinsics_apply_k4a_crop_and_binning(self) -> None:
+        import numpy as np
+
+        from open3d_reconstruct.mkv_portable import mode_specific_calibration
+
+        depth = mode_specific_calibration(
+            _calibration_camera("CALIBRATION_CameraPurposeDepth", width=1024, height=1024),
+            width=512,
+            height=512,
+            kind="depth",
+        )
+        color = mode_specific_calibration(
+            _calibration_camera(
+                "CALIBRATION_CameraPurposePhotoVideo", width=4096, height=3072
+            ),
+            width=1280,
+            height=720,
+            kind="color",
+        )
+
+        np.testing.assert_allclose(
+            depth.matrix,
+            [[256.0, 0.0, 255.5], [0.0, 256.0, 255.5], [0.0, 0.0, 1.0]],
+        )
+        np.testing.assert_allclose(
+            color.matrix,
+            [[640.0, 0.0, 639.5], [0.0, 480.0, 359.5], [0.0, 0.0, 1.0]],
+        )
+
+    def test_probe_combines_container_and_track_metadata(self) -> None:
+        from open3d_reconstruct.mkv_portable import probe_mkv
+
+        probe_value = {
+            "streams": [
+                {
+                    "index": 0,
+                    "width": 1280,
+                    "height": 720,
+                    "tags": {"title": "COLOR", "K4A_COLOR_MODE": "MJPG_720P"},
+                },
+                {
+                    "index": 1,
+                    "width": 512,
+                    "height": 512,
+                    "tags": {"title": "DEPTH", "K4A_DEPTH_MODE": "WFOV_2X2BINNED"},
+                },
+            ],
+            "format": {"tags": {"K4A_DEVICE_SERIAL_NUMBER": "serial"}},
+        }
+        with mock.patch(
+            "open3d_reconstruct.mkv_portable._run_json", return_value=probe_value
+        ):
+            result = probe_mkv(Path("recording.mkv"), "ffprobe")
+
+        self.assertEqual(result.color.index, 0)
+        self.assertEqual(result.depth.index, 1)
+        self.assertEqual(result.tags["K4A_COLOR_MODE"], "MJPG_720P")
+        self.assertEqual(result.tags["K4A_DEPTH_MODE"], "WFOV_2X2BINNED")
+        self.assertEqual(result.tags["K4A_DEVICE_SERIAL_NUMBER"], "serial")
+
+    def test_rational6kt_uses_the_k4a_tangential_convention(self) -> None:
+        import numpy as np
+
+        from open3d_reconstruct.mkv_portable import (
+            _project_normalized,
+            mode_specific_calibration,
+        )
+
+        parameters = [
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.01,
+            0.02,
+        ]
+        camera_json = _calibration_camera(
+            "CALIBRATION_CameraPurposeDepth",
+            width=1024,
+            height=1024,
+            parameters=parameters,
+        )
+        camera_json["Intrinsics"]["ModelType"] = (
+            "CALIBRATION_LensDistortionModelRational6KT"
+        )
+        camera = mode_specific_calibration(
+            camera_json, width=512, height=512, kind="depth"
+        )
+
+        projected_x, projected_y, valid = _project_normalized(
+            camera, np.array([0.1]), np.array([0.2])
+        )
+
+        self.assertTrue(bool(valid[0]))
+        # K4A's Rational6KT model uses x*y*p1/p2, whereas Brown-Conrady
+        # and OpenCV use 2*x*y*p1/p2.
+        self.assertAlmostEqual(float(projected_x[0]), 0.1011 * 256 + 255.5)
+        self.assertAlmostEqual(float(projected_y[0]), 0.2028 * 256 + 255.5)
+
+    def test_identity_calibration_produces_matching_rgbd_shapes(self) -> None:
+        import numpy as np
+
+        from open3d_reconstruct.mkv_portable import RGBDAligner, mode_specific_calibration
+
+        depth = mode_specific_calibration(
+            _calibration_camera("CALIBRATION_CameraPurposeDepth", width=1024, height=1024),
+            width=512,
+            height=512,
+            kind="depth",
+        )
+        color = mode_specific_calibration(
+            _calibration_camera(
+                "CALIBRATION_CameraPurposePhotoVideo", width=4096, height=3072
+            ),
+            width=1280,
+            height=720,
+            kind="color",
+        )
+        aligner = RGBDAligner(depth, color)
+        source_color = np.full((720, 1280, 3), [12, 34, 56], dtype=np.uint8)
+        source_depth = np.full((512, 512), 1000, dtype=np.uint16)
+
+        aligned_color, aligned_depth = aligner.align(source_color, source_depth)
+
+        self.assertEqual(aligned_color.shape, (512, 512, 3))
+        self.assertEqual(aligned_depth.shape, (512, 512))
+        np.testing.assert_array_equal(aligned_color[256, 256], [12, 34, 56])
+        self.assertEqual(int(aligned_depth[256, 256]), 1000)
 
 
 class ExtractionSafetyTests(unittest.TestCase):

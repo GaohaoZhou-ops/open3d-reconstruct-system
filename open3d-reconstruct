@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+SYSTEM_NAME="$(uname -s)"
 K4A_LIB="$PROJECT_ROOT/.deps/k4a/usr/lib/x86_64-linux-gnu"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -22,7 +23,7 @@ export UV_PYTHON_BIN_DIR="$PROJECT_ROOT/.python/bin"
 export UV_TOOL_DIR="$PROJECT_ROOT/.tools/uv-tools"
 export UV_TOOL_BIN_DIR="$PROJECT_ROOT/.tools/uv-tool-bin"
 
-if [[ -d "$K4A_LIB" ]]; then
+if [[ "$SYSTEM_NAME" == "Linux" && -d "$K4A_LIB" ]]; then
     export LD_LIBRARY_PATH="$K4A_LIB:$K4A_LIB/libk4a1.4${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 

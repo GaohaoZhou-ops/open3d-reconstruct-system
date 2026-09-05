@@ -8,7 +8,12 @@ from typing import Any
 
 from .configuration import read_json_object
 from .live import LivePreviewPublisher
-from .paths import DEFAULT_AZURE_SENSOR_CONFIG, K4A_LIB_DIR
+from .paths import (
+    DEFAULT_AZURE_SENSOR_CONFIG,
+    K4A_CORE_LIBRARY,
+    K4A_LIVE_SUPPORTED,
+    K4A_RECORD_LIBRARY,
+)
 
 
 K4A_RESULT_SUCCEEDED = 0
@@ -126,8 +131,13 @@ def native_configuration(path: Path | None = None) -> K4ADeviceConfiguration:
 
 class K4ALibraries:
     def __init__(self) -> None:
-        core_path = K4A_LIB_DIR / "libk4a.so.1.4"
-        record_path = K4A_LIB_DIR / "libk4arecord.so.1.4"
+        if not K4A_LIVE_SUPPORTED:
+            raise RuntimeError(
+                "Azure Kinect 实时采集需要官方 K4A SDK，当前仅支持 Linux x86_64；"
+                "macOS 可以离线提取和重建已有 MKV"
+            )
+        core_path = K4A_CORE_LIBRARY
+        record_path = K4A_RECORD_LIBRARY
         if not core_path.exists() or not record_path.exists():
             raise RuntimeError("项目内 Azure Kinect SDK 运行库不完整")
         self.core = ctypes.CDLL(str(core_path), mode=ctypes.RTLD_GLOBAL)

@@ -205,7 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     service_commands.add_parser("stop", help="安全停止服务及当前相机任务")
 
     udev_parser = subparsers.add_parser(
-        "udev-install", help="把项目自带的设备权限规则安装到系统（唯一需要 sudo 的可选步骤）"
+        "udev-install",
+        help="在 Linux 安装设备权限规则（macOS 不使用 udev）",
     )
     _add_camera_option(udev_parser, default="all", allow_all=True)
     subparsers.add_parser("self-test", help="运行不需要设备的离线 RGB-D 重建自检")

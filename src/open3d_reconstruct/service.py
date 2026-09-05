@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -93,7 +94,31 @@ def _process_stat(pid: int) -> tuple[int, str] | None:
     try:
         value = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
     except (OSError, UnicodeError):
-        return None
+        if sys.platform != "darwin":
+            return None
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-o", "state=", "-o", "lstart=", "-p", str(pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="ascii",
+                errors="replace",
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        fields = result.stdout.strip().split(maxsplit=1)
+        if result.returncode != 0 or len(fields) != 2:
+            return None
+        state, started = fields
+        token = int.from_bytes(
+            hashlib.blake2s(started.encode("ascii"), digest_size=8).digest(),
+            byteorder="big",
+        )
+        return token, state[:1]
     end = value.rfind(")")
     if end < 0:
         return None

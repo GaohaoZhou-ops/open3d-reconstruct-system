@@ -6,10 +6,18 @@ from pathlib import Path
 
 from .configuration import read_json_object
 from .extraction import complete_extraction, prepare_extraction
-from .paths import DEFAULT_SENSOR_CONFIG, RECORDINGS_DIR
+from .paths import DEFAULT_SENSOR_CONFIG, K4A_LIVE_SUPPORTED, RECORDINGS_DIR, SYSTEM
 
 
 RECORDING_EXTENSION = ".mkv"
+
+
+def _require_live_capture() -> None:
+    if not K4A_LIVE_SUPPORTED:
+        raise RuntimeError(
+            f"Azure Kinect 实时采集不支持 {SYSTEM}；macOS 可提取和重建已有 MKV，"
+            "实时采集请继续使用 Linux x86_64"
+        )
 
 
 def _open3d():
@@ -27,6 +35,7 @@ def _device_index(value: int) -> int:
 def _ensure_device_available(value: int) -> int:
     from .doctor import k4a_device_count
 
+    _require_live_capture()
     value = _device_index(value)
     count = k4a_device_count()
     if count == 0:
@@ -47,6 +56,11 @@ def load_sensor_config(path: Path | None = None):
 def list_devices() -> None:
     from .doctor import k4a_device_count
 
+    if not K4A_LIVE_SUPPORTED:
+        print(
+            f"Azure Kinect 实时采集不支持 {SYSTEM}；已有 MKV 仍可离线提取和重建。"
+        )
+        return
     o3d = _open3d()
     count = k4a_device_count()
     if count == 0:
@@ -252,6 +266,34 @@ def extract_mkv(
     force: bool = False,
     stride: int = 1,
 ) -> Path:
+    if not K4A_LIVE_SUPPORTED:
+        from .mkv_portable import extract_mkv_portable
+
+        return extract_mkv_portable(
+            source,
+            destination,
+            force=force,
+            stride=stride,
+        )
+    try:
+        o3d = _open3d()
+        native_reader = bool(
+            getattr(o3d, "_build_config", {}).get("BUILD_AZURE_KINECT")
+            and hasattr(o3d.io, "AzureKinectMKVReader")
+            and hasattr(o3d.io, "write_azure_kinect_mkv_metadata")
+        )
+    except Exception:
+        native_reader = False
+    if not native_reader:
+        from .mkv_portable import extract_mkv_portable
+
+        return extract_mkv_portable(
+            source,
+            destination,
+            force=force,
+            stride=stride,
+        )
+
     o3d = _open3d()
     workspace = prepare_extraction(
         source,

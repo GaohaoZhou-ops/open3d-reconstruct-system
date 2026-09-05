@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .paths import AZURE_UDEV_RULE, REALSENSE_UDEV_RULE
@@ -31,6 +32,10 @@ def _selected_rules(camera: str):
 
 
 def install_udev_rules(camera: str = "all") -> None:
+    if sys.platform != "linux":
+        print("macOS 不使用 udev，无需安装设备规则。")
+        print("RealSense 实时采集若被系统拒绝，请按诊断提示从终端使用 sudo 启动。")
+        return
     selected = _selected_rules(camera)
     pending: list[tuple[str, Path, Path]] = []
     for label, source, target in selected:

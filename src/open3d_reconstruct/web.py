@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -242,6 +243,91 @@ class WebActionError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.CONFLICT) -> None:
         super().__init__(message)
         self.status = int(status)
+
+
+def _native_file_picker(
+    *,
+    title: str,
+    extensions: tuple[str, ...],
+    initial_directory: Path | None = None,
+    allow_all: bool = False,
+) -> str | None:
+    if sys.platform == "darwin":
+        picker = shutil.which("osascript")
+        if picker is None:
+            raise WebActionError(
+                "系统缺少 osascript，无法打开 macOS 文件选择窗口",
+                HTTPStatus.NOT_IMPLEMENTED,
+            )
+        normalized = tuple(item.lstrip(".").lower() for item in extensions)
+        if not normalized or any(not item.isalnum() for item in normalized):
+            raise ValueError("macOS 文件类型过滤器无效")
+        type_list = ", ".join(f'"{item}"' for item in normalized)
+        script = (
+            "on run argv\n"
+            "set promptText to item 1 of argv\n"
+            + (
+                "set startFolder to POSIX file (item 2 of argv)\n"
+                f"set selectedFile to choose file with prompt promptText of type {{{type_list}}} "
+                "default location startFolder\n"
+                if initial_directory is not None
+                else f"set selectedFile to choose file with prompt promptText of type {{{type_list}}}\n"
+            )
+            + "return POSIX path of selectedFile\nend run"
+        )
+        command = [picker, "-e", script, title]
+        if initial_directory is not None:
+            command.append(str(initial_directory))
+        cancel_codes = {1}
+    else:
+        picker = shutil.which("zenity")
+        if picker is None:
+            raise WebActionError(
+                "系统未安装 zenity，无法打开本机文件选择窗口",
+                HTTPStatus.NOT_IMPLEMENTED,
+            )
+        patterns = " ".join(
+            pattern
+            for extension in extensions
+            for pattern in (f"*.{extension.lower()}", f"*.{extension.upper()}")
+        )
+        command = [
+            picker,
+            "--file-selection",
+            f"--title={title}",
+        ]
+        if initial_directory is not None:
+            command.append(f"--filename={initial_directory}{os.sep}")
+        label = "PLY 点云与网格" if extensions == ("ply",) else "录制文件"
+        command.append(f"--file-filter={label} | {patterns}")
+        if allow_all:
+            command.append("--file-filter=所有文件 | *")
+        cancel_codes = {1, 5}
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        raise WebActionError(
+            f"无法打开本机文件选择窗口: {exc}",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        ) from exc
+    if result.returncode in cancel_codes or not result.stdout.strip():
+        return None
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"退出代码 {result.returncode}"
+        raise WebActionError(
+            f"本机文件选择失败: {detail}",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return result.stdout.strip()
 
 
 def _now_iso() -> str:
@@ -1406,45 +1492,14 @@ class ControlCenter:
         if not self._file_picker_lock.acquire(blocking=False):
             raise WebActionError("本地文件选择窗口已经打开")
         try:
-            picker = shutil.which("zenity")
-            if picker is None:
-                raise WebActionError(
-                    "系统未安装 zenity，无法打开本机文件选择窗口",
-                    HTTPStatus.NOT_IMPLEMENTED,
-                )
-            try:
-                result = subprocess.run(
-                    [
-                        picker,
-                        "--file-selection",
-                        "--title=选择 Azure Kinect MKV 或 RealSense BAG",
-                        "--file-filter=录制文件 | *.mkv *.MKV *.bag *.BAG",
-                        "--file-filter=所有文件 | *",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except OSError as exc:
-                raise WebActionError(
-                    f"无法打开本机文件选择窗口: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                ) from exc
-            if result.returncode in {1, 5} or not result.stdout.strip():
-                return None
-            if result.returncode != 0:
-                detail = result.stderr.strip() or f"退出代码 {result.returncode}"
-                raise WebActionError(
-                    f"本机文件选择失败: {detail}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-            return self.reference_local_recording(
-                result.stdout.strip(), hardware=hardware
+            selected = _native_file_picker(
+                title="选择 Azure Kinect MKV 或 RealSense BAG",
+                extensions=("mkv", "bag"),
+                allow_all=True,
             )
+            if selected is None:
+                return None
+            return self.reference_local_recording(selected, hardware=hardware)
         finally:
             self._file_picker_lock.release()
 
@@ -1521,44 +1576,15 @@ class ControlCenter:
         if not self._file_picker_lock.acquire(blocking=False):
             raise WebActionError("本地文件选择窗口已经打开")
         try:
-            picker = shutil.which("zenity")
-            if picker is None:
-                raise WebActionError(
-                    "系统未安装 zenity，无法打开本机文件选择窗口",
-                    HTTPStatus.NOT_IMPLEMENTED,
-                )
             initial_directory = self._point_cloud_picker_directory()
-            try:
-                result = subprocess.run(
-                    [
-                        picker,
-                        "--file-selection",
-                        "--title=选择 PLY 点云文件",
-                        f"--filename={initial_directory}{os.sep}",
-                        "--file-filter=PLY 点云与网格 | *.ply *.PLY",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except OSError as exc:
-                raise WebActionError(
-                    f"无法打开本机文件选择窗口: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                ) from exc
-            if result.returncode in {1, 5} or not result.stdout.strip():
+            selected = _native_file_picker(
+                title="选择 PLY 点云文件",
+                extensions=("ply",),
+                initial_directory=initial_directory,
+            )
+            if selected is None:
                 return None
-            if result.returncode != 0:
-                detail = result.stderr.strip() or f"退出代码 {result.returncode}"
-                raise WebActionError(
-                    f"本机文件选择失败: {detail}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-            return self.select_local_point_cloud(result.stdout.strip())
+            return self.select_local_point_cloud(selected)
         finally:
             self._file_picker_lock.release()
 

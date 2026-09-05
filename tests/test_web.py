@@ -23,6 +23,7 @@ from open3d_reconstruct.web import (
     WebActionError,
     _camera_configuration,
     _clean_recording_name,
+    _native_file_picker,
     _recording_import_spec,
     _validated_reconstruction_parameters,
     create_server,
@@ -60,6 +61,39 @@ class WebNameTests(unittest.TestCase):
         )
         with self.assertRaises(WebActionError):
             _recording_import_spec("points.ply")
+
+
+class WebNativePickerTests(unittest.TestCase):
+    def test_macos_picker_uses_osascript_and_passes_initial_directory(self) -> None:
+        initial = Path("/tmp/包含 空格")
+        completed = subprocess.CompletedProcess(
+            args=["osascript"],
+            returncode=0,
+            stdout="/tmp/扫描结果.ply\n",
+            stderr="",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "darwin"),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/usr/bin/osascript",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            selected = _native_file_picker(
+                title="选择 PLY 点云文件",
+                extensions=("ply",),
+                initial_directory=initial,
+            )
+
+        self.assertEqual(selected, "/tmp/扫描结果.ply")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/osascript")
+        self.assertEqual(command[-1], str(initial))
+        self.assertIn('of type {"ply"}', command[2])
 
 
 class WebReconstructionParameterTests(unittest.TestCase):
@@ -323,6 +357,7 @@ class WebRecordingManagementTests(unittest.TestCase):
             args=["zenity"], returncode=0, stdout=f"{source}\n", stderr=""
         )
         with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
             mock.patch(
                 "open3d_reconstruct.web.shutil.which",
                 return_value="/usr/bin/zenity",
@@ -417,6 +452,7 @@ class WebPointCloudTests(unittest.TestCase):
             args=["zenity"], returncode=0, stdout=f"{source}\n", stderr=""
         )
         with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
             mock.patch(
                 "open3d_reconstruct.web.shutil.which",
                 return_value="/usr/bin/zenity",

@@ -1,6 +1,6 @@
 # open3d-reconstruct
 
-这是一个面向 Azure Kinect DK、Intel RealSense D435 和 D435i 的本地隔离版
+这是一个面向 Azure Kinect DK、Intel RealSense D435 和 D435i 的跨平台、本地隔离版
 Open3D 重建系统。它保留 Open3D 0.19 原生 Reconstruction System 的完整流程：
 RGB-D 里程计与片段生成、片段全局配准、精细 ICP 配准、TSDF 网格融合，并保留
 SLAC 与颜色映射优化。
@@ -10,16 +10,57 @@ SLAC 与颜色映射优化。
 
 ## 当前状态
 
-- 目标系统：Ubuntu 20.04 x86_64
+- 目标系统：Ubuntu 20.04 x86_64、macOS arm64/x86_64
 - Python：项目内 CPython 3.12 + `.venv`
-- Open3D：0.19.0
-- Azure Kinect Sensor SDK：1.4.1，位于 `.deps/k4a/`
-- RealSense：Open3D wheel 内置 librealsense，无需系统 SDK 或 `pyrealsense2`
+- Open3D：0.19.0；macOS 使用官方 universal2 wheel，已在 Apple Silicon 验证
+- Azure Kinect：Linux 使用 `.deps/k4a/` 中的 Sensor SDK 1.4.1；macOS 使用
+  FFmpeg + MKV 内嵌工厂标定完成已有录像的离线提取与重建
+- RealSense：Open3D wheel 内置 librealsense，无需系统 SDK 或 `pyrealsense2`；macOS
+  的实时 USB 支持受上游限制，需以实际设备验证
 - D435/D435i：设备枚举、预览、BAG 录制、暂停/继续、提取与一键重建均已接入
 - Web 控制台：录制时实时显示 RGB、深度伪彩和 IMU 三维姿态，重建前可选择速度/质量
   参数，重建时显示阶段心跳、输入帧与局部 PLY；全部使用本机 11920 单口
 - 无设备单元测试和四阶段合成 RGB-D 重建自检：已通过
-- Azure Kinect 与 D435/D435i 真机采集：等待设备接入验证
+- macOS 示例 `data/recordings/web-20260903-105959.mkv`：125 帧提取和四阶段重建已通过
+- Azure Kinect 与 D435/D435i 真机采集：Linux 保留原实现；macOS 的 Azure 实时采集
+  因官方 SDK 不支持而明确禁用，RealSense 等待设备接入验证
+
+平台能力如下：
+
+| 功能 | Linux x86_64 | macOS arm64/x86_64 |
+| --- | --- | --- |
+| Open3D 重建 / Web 控制台 | 支持 | 支持 |
+| Azure Kinect 已有 MKV | K4A 原生读取 | FFmpeg 标定后端 |
+| Azure Kinect 实时预览与录制 | 支持 | 官方 SDK 不支持 |
+| RealSense 已有 BAG | 支持 | 支持 |
+| RealSense 实时预览与录制 | 支持 | 上游实验性支持，取决于设备与 USB 权限 |
+
+## macOS 快速开始
+
+macOS 只额外需要 FFmpeg。若尚未安装：
+
+```bash
+brew install ffmpeg
+```
+
+然后运行项目安装器；它会自动识别 Intel 或 Apple Silicon，并把正确架构的 CPython
+3.12 和 wheel 安装在项目内：
+
+```bash
+./setup.sh
+./open3d-reconstruct doctor
+```
+
+直接验证仓库中的示例录像：
+
+```bash
+./open3d-reconstruct reconstruct \
+  data/recordings/web-20260903-105959.mkv
+```
+
+该命令自动执行 MKV 提取、标定对齐和四阶段重建。结果位于
+`data/datasets/web-20260903-105959/scene/integrated.ply`。也可以先用
+`./start-service.sh` 启动 Web 控制台，再选择“打开本地录制”。
 
 ## 本地隔离
 
@@ -35,7 +76,7 @@ SLAC 与颜色映射优化。
 | --- | --- |
 | CPython 3.12 | `.python/` |
 | Python 虚拟环境和全部 Python 包 | `.venv/` |
-| Azure Kinect SDK 与深度引擎 | `.deps/k4a/` |
+| Azure Kinect SDK 与深度引擎（仅 Linux） | `.deps/k4a/` |
 | `uv` | `.tools/` |
 | 下载及运行缓存 | `.cache/` |
 | 录制和重建数据 | `data/` |
@@ -44,9 +85,10 @@ RealSense 的 librealsense 已静态集成在 `.venv` 内的 Open3D wheel 中，
 系统安装的 librealsense。启动器使用 Python isolated mode，并清除外部
 `PYTHONPATH`，避免 ROS、Conda 和用户 site-packages 混入。
 
-Linux 内核、USB、OpenGL/X11 和 glibc 属于操作系统基础设施。udev 规则必须由
-Linux 从 `/etc/udev/rules.d/` 读取，因此非 root 访问相机时可能需要一次显式的
-`udev-install`；这是唯一可选的项目外配置。
+操作系统内核、USB 与图形栈属于系统基础设施。Linux 的 udev 规则必须从
+`/etc/udev/rules.d/` 读取，因此非 root 访问相机时可能需要一次显式的
+`udev-install`。macOS 不使用 udev；FFmpeg 由 Homebrew 安装在项目外，Python 与
+Python 包仍保持项目内隔离。
 
 ## Web 可视化控制台
 
@@ -94,6 +136,10 @@ MKV/BAG 后退出。为保护录制文件，超时后脚本只报告错误，不
 ```
 
 前台命令使用同一把进程锁，因此后台服务存在时也不会重复启动。它会自动打开浏览器。
+macOS 上“打开本地录制”和“加载其他点云”使用系统原生文件选择窗口；Linux 使用
+Zenity。由于 Azure Kinect 官方 Sensor SDK 没有 macOS 后端，macOS 页面中应通过
+“打开本地录制”载入已有 MKV，而不是连接 Azure 相机。
+
 页面中的操作顺序为：
 
 1. 选择 Azure Kinect DK、RealSense D435 或 D435i，并确认设备编号。每张相机卡片的
@@ -140,7 +186,7 @@ Azure Kinect 浏览器预览目标为 20 FPS；页面会分别显示相机采集
 录制主循环中重复解码、缩放和编码。RealSense 预览目标为 8 FPS，以兼顾其同步软件
 编码开销。Azure Kinect 的 Web 录制使用项目内 K4A SDK 同一设备句柄同时写入 RGB-D
 capture 和 IMU track，预览不会再次连接或争抢相机。实时深度显示在原始深度坐标系；
-转换后的数据集仍按重建要求对齐到彩色图像。
+转换后的数据集会按工厂标定变换到统一针孔坐标系，并保证彩色、深度和内参尺寸一致。
 
 Web 中的三维姿态轴使用陀螺仪积分，并用加速度方向持续校正 Roll/Pitch；Yaw 是相对角度，
 长时间使用可能发生漂移。该视图用于帮助判断相机运动，不代表重建求得的相机轨迹。
@@ -167,8 +213,10 @@ D435/D435i 应直接连接 USB 3.x 端口。接入后运行：
 ./open3d-reconstruct udev-install --camera realsense
 ```
 
-该命令会明确调用 `sudo`，安装项目内的
-`config/99-realsense-libusb.rules`。安装后重新插拔相机，再运行诊断。
+该步骤仅适用于 Linux：命令会明确调用 `sudo`，安装项目内的
+`config/99-realsense-libusb.rules`。安装后重新插拔相机，再运行诊断。macOS 不使用
+udev，执行该命令只会给出说明而不会修改系统；若设备已接入但 SDK 仍枚举不到，请参考
+librealsense 的 macOS USB 权限限制，或先使用已有 BAG 做离线重建。
 
 列出设备能力并预览：
 
@@ -267,7 +315,7 @@ data/datasets/first-scan/run-report.json
 
 ## Azure Kinect
 
-为兼容已有用法，采集命令不指定 `--camera` 时仍默认 Azure Kinect：
+Linux 上为兼容已有用法，采集命令不指定 `--camera` 时仍默认 Azure Kinect：
 
 ```bash
 ./open3d-reconstruct doctor --camera azure-kinect --require-device
@@ -281,7 +329,22 @@ data/datasets/first-scan/run-report.json
 ./open3d-reconstruct udev-install --camera azure-kinect
 ```
 
-`udev-install` 不指定相机时会安装 Azure Kinect 和 RealSense 两套规则。
+`udev-install` 不指定相机时会安装 Azure Kinect 和 RealSense 两套规则。这些实时采集和
+udev 命令仅适用于 Linux x86_64。
+
+Azure Kinect Sensor SDK 官方没有 macOS 运行时，Open3D 的 macOS wheel 也以
+`BUILD_AZURE_KINECT=OFF` 构建。因此 macOS 不伪装实时支持：`list`、`preview`、
+`record` 和 `scan` 会给出明确提示。已有 MKV 则可以直接处理：
+
+```bash
+./open3d-reconstruct extract data/recordings/room.mkv
+./open3d-reconstruct reconstruct data/recordings/room.mkv
+```
+
+macOS 后端通过 FFmpeg 同步解码 COLOR/DEPTH 轨道，读取 MKV 内嵌的工厂标定，应用 K4A
+模式对应的裁剪、缩放、Brown-Conrady 畸变和深度到彩色外参，再把彩色与深度输出到同一
+个无畸变深度针孔坐标系。原始标定会保存在数据集的 `azure-calibration.json`，实际内参
+与后端信息分别写入 `intrinsic.json` 和 `.open3d-reconstruct.json`。
 
 ## 设备选择与配置
 
@@ -372,10 +435,12 @@ Reconstruction System 仍只使用 RGB-D；当前版本不把 IMU 融入相机�
 ## 上游与许可
 
 - [Open3D 0.19.0](https://github.com/isl-org/Open3D/tree/v0.19.0) 及其
-  Reconstruction System 使用 MIT License。
+  Reconstruction System 使用 MIT License；官方 0.19 wheel 提供 macOS universal2 / Apple
+  Silicon 支持。
 - Open3D 0.19.0 wheel 以 `BUILD_LIBREALSENSE=ON` 集成
   [librealsense v2.44.0](https://github.com/IntelRealSense/librealsense/tree/v2.44.0)，
-  使用 Apache License 2.0。
+  使用 Apache License 2.0。macOS 实时 USB 的上游限制见
+  [librealsense macOS 安装说明](https://github.com/realsenseai/librealsense/blob/master/doc/installation_osx.md)。
 - [Azure Kinect Sensor SDK 1.4.1](https://github.com/microsoft/Azure-Kinect-Sensor-SDK/tree/v1.4.1)
   的开源部分使用 MIT License；随包二进制适用微软提供的许可条款。
 - Python 依赖版本与文件哈希固定在 `uv.lock`。
