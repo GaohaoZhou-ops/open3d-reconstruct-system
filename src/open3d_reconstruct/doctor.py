@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .compute import resolve_compute_backend
 from .paths import (
     AZURE_UDEV_RULE,
     IS_LINUX,
@@ -244,6 +245,14 @@ def _base_checks() -> tuple[list[Check], object | None]:
                 "ok" if open3d_ok else "fail",
                 "Open3D",
                 f"{o3d.__version__} @ {module_path}",
+            )
+        )
+        compute = resolve_compute_backend("auto")
+        checks.append(
+            Check(
+                "ok" if compute.accelerated else "warn",
+                "重建计算后端",
+                compute.detail,
             )
         )
         return checks, o3d

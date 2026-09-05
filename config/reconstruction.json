@@ -12,5 +12,6 @@
   "preference_loop_closure_registration": 5.0,
   "icp_method": "color",
   "global_registration": "ransac",
-  "python_multi_threading": true
+  "python_multi_threading": true,
+  "compute_backend": "auto"
 }

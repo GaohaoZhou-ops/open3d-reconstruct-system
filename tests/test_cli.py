@@ -41,6 +41,14 @@ class CliCameraTests(unittest.TestCase):
         self.assertTrue(status.quiet)
         self.assertEqual(stop.service_command, "stop")
 
+    def test_reconstruction_uses_automatic_compute_backend(self) -> None:
+        automatic = self.parser.parse_args(["reconstruct", "dataset"])
+        cpu = self.parser.parse_args(
+            ["reconstruct", "dataset", "--compute-backend", "cpu"]
+        )
+        self.assertEqual(automatic.compute_backend, "auto")
+        self.assertEqual(cpu.compute_backend, "cpu")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open3d-reconstruct"
-version = "0.4.0"
+version = "0.5.0"
 description = "Locally isolated Azure Kinect and RealSense Open3D reconstruction workflow with a local web console"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -15,6 +15,9 @@ dependencies = [
     "numpy==1.26.4",
     "open3d==0.19.0",
     "opencv-python-headless==4.10.0.84",
+    # One tensor implementation serves NVIDIA CUDA on Linux and Metal/MPS on
+    # Apple Silicon. Intel macOS remains supported through the Open3D CPU path.
+    "torch==2.14.0; sys_platform == 'linux' or (sys_platform == 'darwin' and platform_machine == 'arm64')",
 ]
 
 [project.scripts]

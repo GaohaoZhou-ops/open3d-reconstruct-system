@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from .compute import normalize_compute_backend
 from .paths import DEFAULT_RECONSTRUCTION_CONFIG
 
 
@@ -50,6 +51,7 @@ def build_reconstruction_config(
     debug: bool = False,
     single_thread: bool = False,
     device: str = "CPU:0",
+    compute_backend: str = "auto",
 ) -> dict[str, Any]:
     config = read_json_object(DEFAULT_RECONSTRUCTION_CONFIG)
     dataset_config_path = dataset / "config.json"
@@ -64,6 +66,7 @@ def build_reconstruction_config(
     config["path_intrinsic"] = str(intrinsic.resolve())
     config["debug_mode"] = bool(debug)
     config["device"] = device
+    config["compute_backend"] = normalize_compute_backend(compute_backend)
     if single_thread:
         config["python_multi_threading"] = False
     validate_reconstruction_config(config)
@@ -116,6 +119,7 @@ def validate_reconstruction_config(config: dict[str, Any]) -> None:
         )
     if not isinstance(config.get("python_multi_threading"), bool):
         raise ValueError("python_multi_threading 必须是 true 或 false")
+    normalize_compute_backend(config.get("compute_backend", "auto"))
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:

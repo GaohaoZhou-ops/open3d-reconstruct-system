@@ -14,6 +14,8 @@ import os, sys
 import numpy as np
 import open3d as o3d
 
+from open3d_reconstruct.torch_odometry import try_gpu_rgbd_odometry
+
 pyexample_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(pyexample_path)
 
@@ -29,6 +31,7 @@ if with_opencv:
 
 
 WEB_MATCH_PREFIX = "__OPEN3D_WEB_MATCH__ "
+_GPU_FALLBACK_MESSAGES = set()
 
 
 def emit_web_match(status, fragment_id, source, target, kind, success=None,
@@ -72,34 +75,64 @@ def emit_web_match(status, fragment_id, source, target, kind, success=None,
     )
 
 
-def register_one_rgbd_pair(s, t, color_files, depth_files, intrinsic,
-                           with_opencv, config):
-    source_rgbd_image = read_rgbd_image(color_files[s], depth_files[s], True,
-                                        config)
-    target_rgbd_image = read_rgbd_image(color_files[t], depth_files[t], True,
-                                        config)
-
+def _cpu_rgbd_odometry(source_rgbd_image, target_rgbd_image, intrinsic,
+                       initial, config):
     option = o3d.pipelines.odometry.OdometryOption()
     option.depth_diff_max = config["depth_diff_max"]
+    return o3d.pipelines.odometry.compute_rgbd_odometry(
+        source_rgbd_image, target_rgbd_image, intrinsic, initial,
+        o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(), option)
+
+
+def _report_gpu_fallback(detail):
+    if detail in _GPU_FALLBACK_MESSAGES:
+        return
+    _GPU_FALLBACK_MESSAGES.add(detail)
+    print("GPU 里程计回退 CPU：%s" % detail, flush=True)
+
+
+def register_one_rgbd_pair(s, t, color_files, depth_files, intrinsic,
+                           with_opencv, config):
+    source_rgbd_image = None
+    target_rgbd_image = None
     if abs(s - t) != 1:
         if with_opencv:
+            source_rgbd_image = read_rgbd_image(
+                color_files[s], depth_files[s], True, config)
+            target_rgbd_image = read_rgbd_image(
+                color_files[t], depth_files[t], True, config)
             success_5pt, odo_init = pose_estimation(source_rgbd_image,
                                                     target_rgbd_image,
                                                     intrinsic, False)
-            if success_5pt:
-                [success, trans, info
-                ] = o3d.pipelines.odometry.compute_rgbd_odometry(
-                    source_rgbd_image, target_rgbd_image, intrinsic, odo_init,
-                    o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
-                    option)
-                return [success, trans, info]
-        return [False, np.identity(4), np.identity(6)]
+            if not success_5pt:
+                return [False, np.identity(4), np.identity(6)]
+        else:
+            return [False, np.identity(4), np.identity(6)]
     else:
         odo_init = np.identity(4)
-        [success, trans, info] = o3d.pipelines.odometry.compute_rgbd_odometry(
-            source_rgbd_image, target_rgbd_image, intrinsic, odo_init,
-            o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(), option)
-        return [success, trans, info]
+
+    # Consecutive-frame odometry has a stable access pattern and benefits from
+    # a persistent GPU pyramid cache. Loop-closure candidates already pay for
+    # OpenCV feature initialization and jump between frames, so retaining the
+    # legacy CPU refinement there is both faster and more conservative.
+    if abs(s - t) == 1:
+        gpu_result, gpu_error = try_gpu_rgbd_odometry(
+            color_files[s], depth_files[s], color_files[t], depth_files[t],
+            intrinsic, config, odo_init)
+        if gpu_result is not None and gpu_result.success:
+            return [True, gpu_result.transformation, gpu_result.information]
+        if gpu_error:
+            _report_gpu_fallback(gpu_error)
+        elif gpu_result is not None:
+            _report_gpu_fallback("未收敛（%s）" % gpu_result.detail)
+
+    if source_rgbd_image is None:
+        source_rgbd_image = read_rgbd_image(
+            color_files[s], depth_files[s], True, config)
+        target_rgbd_image = read_rgbd_image(
+            color_files[t], depth_files[t], True, config)
+    return _cpu_rgbd_odometry(
+        source_rgbd_image, target_rgbd_image, intrinsic, odo_init, config)
 
 
 def make_posegraph_for_fragment(path_dataset, sid, eid, color_files,
@@ -235,18 +268,37 @@ def run(config):
     n_fragments = int(
         math.ceil(float(n_files) / config['n_frames_per_fragment']))
 
-    max_workers = (min(max(1, multiprocessing.cpu_count() - 1), n_fragments)
-                   if config["python_multi_threading"] is True else 1)
+    gpu_active = (
+        bool(config.get("compute_accelerated"))
+        and config.get("compute_backend_resolved") in {"cuda", "mps"}
+    )
+    if config["python_multi_threading"] is True:
+        worker_limit = max(1, multiprocessing.cpu_count() - 1)
+        if config.get("compute_backend_resolved") == "mps":
+            # Two Metal contexts overlap CPU loop-closure and TSDF work while
+            # keeping unified-memory pressure bounded on base M-series chips.
+            worker_limit = min(worker_limit, 2)
+        elif config.get("compute_backend_resolved") == "cuda":
+            # Avoid multiplying CUDA contexts and tensor caches on one GPU.
+            worker_limit = 1
+        max_workers = min(worker_limit, n_fragments)
+    else:
+        max_workers = 1
     print("局部片段计划：%d 帧，%d 个片段，使用 %d 个并行进程。" %
           (n_files, n_fragments, max_workers), flush=True)
+    if gpu_active and max_workers == 1:
+        print("GPU 里程计使用单进程持久上下文。", flush=True)
+    elif gpu_active:
+        print("Metal/MPS 使用 %d 个隔离进程，重叠 GPU 里程计与 CPU 片段工作。" %
+              max_workers, flush=True)
 
-    if config["python_multi_threading"] is True:
+    args = [(fragment_id, color_files, depth_files, n_files,
+             n_fragments, config) for fragment_id in range(n_fragments)]
+    if config["python_multi_threading"] is True and max_workers > 1:
         # Prevent over allocation of open mp threads in child processes
         os.environ['OMP_NUM_THREADS'] = '1'
         mp_context = multiprocessing.get_context('spawn')
         with mp_context.Pool(processes=max_workers) as pool:
-            args = [(fragment_id, color_files, depth_files, n_files,
-                     n_fragments, config) for fragment_id in range(n_fragments)]
             for completed, fragment_id in enumerate(
                     pool.imap_unordered(process_single_fragment_with_result,
                                         args), start=1):

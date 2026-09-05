@@ -13,6 +13,8 @@ SLAC 与颜色映射优化。
 - 目标系统：Ubuntu 20.04 x86_64、macOS arm64/x86_64
 - Python：项目内 CPython 3.12 + `.venv`
 - Open3D：0.19.0；macOS 使用官方 universal2 wheel，已在 Apple Silicon 验证
+- GPU：Linux 自动使用 NVIDIA CUDA，Apple Silicon 自动使用 Metal/MPS；设备、驱动或
+  PyTorch 后端不可用时自动回退 Open3D CPU 路径
 - Azure Kinect：Linux 使用 `.deps/k4a/` 中的 Sensor SDK 1.4.1；macOS 使用
   FFmpeg + MKV 内嵌工厂标定完成已有录像的离线提取与重建
 - RealSense：Open3D wheel 内置 librealsense，无需系统 SDK 或 `pyrealsense2`；macOS
@@ -30,6 +32,7 @@ SLAC 与颜色映射优化。
 | 功能 | Linux x86_64 | macOS arm64/x86_64 |
 | --- | --- | --- |
 | Open3D 重建 / Web 控制台 | 支持 | 支持 |
+| 连续帧 RGB-D 里程计 GPU 加速 | NVIDIA CUDA | Apple Metal/MPS（M 系列） |
 | Azure Kinect 已有 MKV | K4A 原生读取 | FFmpeg 标定后端 |
 | Azure Kinect 实时预览与录制 | 支持 | 官方 SDK 不支持 |
 | RealSense 已有 BAG | 支持 | 支持 |
@@ -304,6 +307,35 @@ data/datasets/first-scan/run-report.json
 
 可用阶段为 `make,register,refine,integrate,slac,slac-integrate`。后续阶段需要前序
 阶段已经生成对应文件。
+
+### GPU 计算后端
+
+重建默认使用 `auto`：Linux 检测 NVIDIA CUDA，Apple Silicon macOS 检测 Metal/MPS；
+没有可用 GPU、PyTorch 无法加载，或 GPU 里程计在运行中报错时，会自动改用原有的
+Open3D CPU 里程计。Intel Mac 也会直接走 CPU。可通过 `doctor` 查看最终选择：
+
+```bash
+./open3d-reconstruct doctor
+```
+
+也可以显式选择或禁用 GPU：
+
+```bash
+./open3d-reconstruct reconstruct data/datasets/room --compute-backend auto
+./open3d-reconstruct reconstruct data/datasets/room --compute-backend cuda
+./open3d-reconstruct reconstruct data/datasets/room --compute-backend mps
+./open3d-reconstruct reconstruct data/datasets/room --compute-backend cpu
+```
+
+GPU 路径使用同一套 Torch 张量实现，在 CUDA 与 MPS 上执行 Open3D 兼容的混合
+光度/深度 RGB-D 里程计；闭环候选的 OpenCV 初始化、全局配准、精细 ICP 和经典 TSDF
+融合仍由 CPU/Open3D 完成。因此 GPU 会降低连续帧里程计的 CPU 占用，但端到端收益会
+随分辨率、深度有效像素、片段数量、闭环候选数量和具体 M 系列/NVIDIA GPU 而变化。
+所有 M 系列使用相同的 MPS 代码路径，不需要按 M1、M2、M3、M4 分别编译。
+
+运行结束后，实际选择的设备会记录在数据集的 `effective-config.json` 和
+`run-report.json` 中。`--compute-device` 是上游 SLAC 流程的独立参数，不控制本节的
+连续帧里程计后端。
 
 颜色映射优化：
 

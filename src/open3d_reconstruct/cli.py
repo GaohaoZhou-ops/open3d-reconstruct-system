@@ -101,9 +101,15 @@ def _add_reconstruction_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--single-thread", action="store_true", help="关闭 Python 多进程")
     parser.add_argument("--debug", action="store_true", help="开启 Open3D 调试可视化")
     parser.add_argument(
+        "--compute-backend",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="重建计算后端；auto 在 Linux 选择 CUDA、在 Apple Silicon 选择 MPS，失败时回退 CPU",
+    )
+    parser.add_argument(
         "--compute-device",
         default="CPU:0",
-        help="SLAC 计算设备，例如 CPU:0 或 CUDA:0",
+        help="仅用于 Open3D SLAC 的设备，例如 CPU:0 或 CUDA:0",
     )
 
 
@@ -266,6 +272,7 @@ def _run_reconstruction(args: argparse.Namespace, dataset: Path) -> Path | None:
         debug=args.debug,
         single_thread=args.single_thread,
         device=args.compute_device,
+        compute_backend=args.compute_backend,
     )
     return run_pipeline(config, parse_stages(args.stages))
 

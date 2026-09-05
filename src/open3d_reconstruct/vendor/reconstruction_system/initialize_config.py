@@ -62,6 +62,7 @@ def initialize_config(config):
     set_default_value(config, "icp_method", "color")
     set_default_value(config, "global_registration", "ransac")
     set_default_value(config, "python_multi_threading", True)
+    set_default_value(config, "compute_backend", "auto")
 
     # `slac` and `slac_integrate` related parameters.
     # `voxel_size` and `depth_min` parameters from previous section,

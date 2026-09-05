@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from .compute import configure_compute_backend
 from .configuration import write_json
 from .paths import VENDOR_RECONSTRUCTION_DIR
 
@@ -131,11 +132,13 @@ def run_pipeline(config: dict[str, Any], stages: Iterable[str]) -> Path | None:
 
     stages = tuple(stages)
     initialize_upstream_config(config)
+    compute = configure_compute_backend(config)
     frame_count = validate_dataset(config)
     dataset = Path(config["path_dataset"])
     write_json(dataset / "effective-config.json", config)
     print(f"数据集检查通过：{frame_count} 帧")
     print(f"执行阶段：{', '.join(STAGE_LABELS[item] for item in stages)}")
+    print(f"计算后端：{compute.backend.upper()}；{compute.detail}")
 
     timings: dict[str, float] = {}
     for index, stage in enumerate(stages, start=1):
@@ -154,6 +157,7 @@ def run_pipeline(config: dict[str, Any], stages: Iterable[str]) -> Path | None:
         "stages": list(stages),
         "timings_seconds": timings,
         "total_seconds": sum(timings.values()),
+        "compute": compute.to_dict(),
     }
     if "integrate" in stages:
         if not mesh_path.is_file() or mesh_path.stat().st_size == 0:
@@ -210,4 +214,3 @@ def run_color_map(
         raise RuntimeError(f"颜色优化没有生成预期文件: {output}")
     print(f"颜色优化网格: {output}")
     return output
-
