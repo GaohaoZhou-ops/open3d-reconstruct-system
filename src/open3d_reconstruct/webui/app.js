@@ -19,6 +19,8 @@ const elements = {
   openRecording: $("#open-recording"),
   openRecordingLabel: $("#open-recording-label"),
   manageRecordings: $("#manage-recordings"),
+  openProject: $("#open-project"),
+  openProjectLabel: $("#open-project-label"),
   openPointCloud: $("#open-point-cloud"),
   openPointCloudLabel: $("#open-point-cloud-label"),
   startConversion: $("#start-conversion"),
@@ -98,8 +100,16 @@ const elements = {
   resultName: $("#result-name"),
   resultSize: $("#result-size"),
   downloadMesh: $("#download-mesh"),
+  downloadProject: $("#download-project"),
   closeLoadedPointCloud: $("#close-loaded-point-cloud"),
   downloadRecording: $("#download-recording"),
+  projectAnalysis: $("#project-analysis"),
+  projectFile: $("#project-file"),
+  projectFrameCount: $("#project-frame-count"),
+  projectDuration: $("#project-duration"),
+  projectCompute: $("#project-compute"),
+  projectMatching: $("#project-matching"),
+  projectStages: $("#project-stages"),
   viewer: $("#model-viewer"),
   meshViewer: $("#model-mesh-viewer"),
   viewerMessage: $("#viewer-message"),
@@ -1027,6 +1037,7 @@ function updateControls() {
   const state = app.state || {
     can_start_recording: true,
     can_import_recording: true,
+    can_open_project: true,
     can_stop_recording: false,
     can_start_conversion: false,
     can_select_point_cloud: true,
@@ -1039,6 +1050,7 @@ function updateControls() {
   elements.stopRecording.disabled = !state.can_stop_recording || app.requestBusy;
   elements.openRecording.disabled = !state.can_import_recording || app.requestBusy;
   elements.manageRecordings.disabled = app.requestBusy;
+  elements.openProject.disabled = state.can_open_project === false || locked;
   elements.openPointCloud.disabled = state.can_select_point_cloud === false || locked;
   elements.startConversion.disabled = !state.can_start_conversion || app.requestBusy;
   const conversionTask = state.task === "convert" || ["converting", "paused", "cancelling"].includes(state.phase);
@@ -1443,7 +1455,11 @@ function renderState(state) {
       setSummary("failed", "正在终止重建", "正在清理计算进程，原始录制不会被删除");
       break;
     case "completed":
-      setSummary("success", "重建已完成", state.mesh ? state.mesh.path : "integrated.ply");
+      setSummary(
+        "success",
+        state.project?.opened ? "重建工程已打开" : "重建已完成",
+        state.project?.path || (state.mesh ? state.mesh.path : "integrated.ply"),
+      );
       break;
     case "error":
       setSummary("failed", "任务未能完成", state.error || "请检查进程日志");
@@ -1786,6 +1802,30 @@ async function chooseLocalPointCloud() {
   }
 }
 
+async function chooseLocalProject() {
+  if (app.requestBusy) return;
+  app.requestBusy = true;
+  elements.errorBanner.hidden = true;
+  elements.openProjectLabel.textContent = "等待本机选择…";
+  setSummary(
+    "running",
+    "请选择重建工程目录",
+    "支持 open3d-project.json，也可自动识别旧版完整数据集",
+  );
+  updateControls();
+  try {
+    const payload = await post("/api/project/select-local");
+    if (!payload.cancelled) renderState(payload.state);
+  } catch (error) {
+    elements.errorBanner.hidden = false;
+    elements.errorBanner.textContent = error.message;
+  } finally {
+    app.requestBusy = false;
+    elements.openProjectLabel.textContent = "打开重建工程";
+    updateControls();
+  }
+}
+
 elements.hardwareInputs.forEach((input) => {
   input.addEventListener("change", () => selectHardware(input.value));
 });
@@ -1804,6 +1844,7 @@ elements.cameraParametersDialog.addEventListener("click", (event) => {
 });
 
 elements.refreshDevices.addEventListener("click", () => fetchDevices(true));
+elements.openProject.addEventListener("click", chooseLocalProject);
 elements.openPointCloud.addEventListener("click", chooseLocalPointCloud);
 elements.closeLoadedPointCloud.addEventListener("click", () => {
   runAction(() => post("/api/point-cloud/clear"));
@@ -1898,6 +1939,43 @@ elements.copyLog.addEventListener("click", async () => {
   }
 });
 
+function renderProjectAnalysis(state, externalReady) {
+  const project = state.project;
+  elements.projectAnalysis.hidden = externalReady || !project;
+  elements.downloadProject.hidden = externalReady || !state.project_url;
+  elements.downloadProject.href = state.project_url || "#";
+  if (elements.projectAnalysis.hidden) return;
+
+  const compute = project.compute || {};
+  const matching = project.matching || {};
+  const attempted = Math.round(finiteNumber(matching.attempted));
+  const succeeded = Math.round(finiteNumber(matching.succeeded));
+  const backend = String(compute.backend || compute.requested || "—").toUpperCase();
+  const device = compute.device ? ` · ${compute.device}` : "";
+  const stageLabels = {
+    make: "局部片段",
+    register: "全局配准",
+    refine: "精细配准",
+    integrate: "场景融合",
+    slac: "SLAC",
+    "slac-integrate": "SLAC 融合",
+  };
+  elements.projectFile.textContent = project.path || project.filename || "open3d-project.json";
+  elements.projectFrameCount.textContent = project.frame_count == null
+    ? "—"
+    : `${Math.round(finiteNumber(project.frame_count))} 帧`;
+  elements.projectDuration.textContent = project.total_seconds == null
+    ? "—"
+    : formatDuration(project.total_seconds);
+  elements.projectCompute.textContent = `${backend}${device}`;
+  elements.projectMatching.textContent = attempted > 0
+    ? `${succeeded} / ${attempted} 成功`
+    : "未记录";
+  elements.projectStages.textContent = (project.stages || [])
+    .map((stage) => stageLabels[stage] || stage)
+    .join(" → ") || "—";
+}
+
 function renderResult(state) {
   const externalReady = Boolean(
     state.loaded_point_cloud_url
@@ -1909,11 +1987,15 @@ function renderResult(state) {
   elements.resultPanel.hidden = !ready;
   if (!ready) {
     app.loadedMeshKey = null;
+    elements.projectAnalysis.hidden = true;
+    elements.downloadProject.hidden = true;
     return;
   }
   const model = externalReady ? state.loaded_point_cloud : state.mesh;
   const modelUrl = externalReady ? state.loaded_point_cloud_url : state.mesh_url;
-  elements.resultSourceLabel.textContent = externalReady ? "本地" : "完成";
+  elements.resultSourceLabel.textContent = externalReady
+    ? "本地"
+    : (state.project?.opened ? "工程" : "完成");
   elements.resultName.textContent = basename(model.path);
   elements.resultSize.textContent = formatBytes(model.size);
   elements.downloadMesh.href = modelUrl;
@@ -1921,6 +2003,7 @@ function renderResult(state) {
   elements.closeLoadedPointCloud.textContent = meshReady ? "返回重建结果" : "关闭预览";
   elements.downloadRecording.href = state.recording_url || "#";
   elements.downloadRecording.hidden = externalReady || !state.recording_url;
+  renderProjectAnalysis(state, externalReady);
   const sourceKind = externalReady ? "external" : "reconstruction";
   const key = `${sourceKind}:${model.path}:${model.size}`;
   if (app.loadedMeshKey !== key) {

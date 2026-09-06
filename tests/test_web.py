@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from open3d_reconstruct.paths import RECORDINGS_DIR, ROOT
+from open3d_reconstruct.project import PROJECT_FILENAME, write_reconstruction_project
 from open3d_reconstruct.web import (
     ControlCenter,
     WEB_MATCH_PREFIX,
@@ -202,6 +203,63 @@ class WebNativePickerTests(unittest.TestCase):
         self.assertEqual(command[0], "/usr/bin/osascript")
         self.assertEqual(command[-1], str(initial))
         self.assertIn('of type {"ply"}', command[2])
+
+    def test_windows_directory_picker_is_topmost(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["powershell.exe"],
+            returncode=0,
+            stdout="C:\\重建工程\n",
+            stderr="",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "win32"),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            selected = _native_file_picker(
+                title="选择 Open3D 重建工程目录",
+                select_directory=True,
+            )
+
+        self.assertEqual(selected, r"C:\重建工程")
+        command = run.call_args.args[0]
+        script = base64.b64decode(command[-1]).decode("utf-16-le")
+        self.assertIn("FolderBrowserDialog", script)
+        self.assertIn("$owner.TopMost = $true", script)
+        self.assertIn("$dialog.SelectedPath", script)
+
+    def test_linux_directory_picker_uses_zenity_directory_mode(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["zenity"], returncode=0, stdout="/tmp/project\n", stderr=""
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", False),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/usr/bin/zenity",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            selected = _native_file_picker(
+                title="选择 Open3D 重建工程目录",
+                select_directory=True,
+            )
+
+        self.assertEqual(selected, "/tmp/project")
+        self.assertIn("--directory", run.call_args.args[0])
+        self.assertFalse(
+            any("--file-filter" in item for item in run.call_args.args[0])
+        )
 
 
 class WebReconstructionParameterTests(unittest.TestCase):
@@ -621,6 +679,106 @@ class WebPointCloudTests(unittest.TestCase):
         self.assertEqual(content_error.exception.status, 415)
 
 
+class WebProjectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller = ControlCenter(ROOT / "open3d-reconstruct")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="open3d-web-project-test-"
+        )
+        self.dataset = Path(self.temporary.name) / "dataset"
+        (self.dataset / "scene").mkdir(parents=True)
+        (self.dataset / "scene" / "integrated.ply").write_bytes(b"ply\nmesh")
+        (self.dataset / "intrinsic.json").write_text("{}\n", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.controller.close()
+        self.temporary.cleanup()
+
+    def test_open_project_restores_result_analysis_and_logs(self) -> None:
+        write_reconstruction_project(
+            self.dataset,
+            hardware="azure-kinect",
+            started_at="2026-09-06T01:00:00+08:00",
+            finished_at="2026-09-06T01:02:00+08:00",
+            settings={"voxel_size": 0.04},
+            conversion={
+                "frame_count": 30,
+                "elapsed_seconds": 120,
+                "matching": {
+                    "expected": 3,
+                    "attempted": 3,
+                    "succeeded": 2,
+                    "failed": 1,
+                    "information_max": 4.5,
+                    "events": [
+                        {
+                            "fragment": 0,
+                            "source": 0,
+                            "target": 1,
+                            "kind": "odometry",
+                            "success": True,
+                            "information": 4.5,
+                        }
+                    ],
+                },
+            },
+            logs=[
+                {"time": "01:00:01", "level": "info", "message": "历史日志"}
+            ],
+        )
+        state = self.controller.open_project(self.dataset)
+
+        self.assertEqual(state["phase"], "completed")
+        self.assertTrue(state["project"]["opened"])
+        self.assertEqual(state["project_url"], "/api/files/project")
+        self.assertEqual(state["mesh_url"], "/api/files/mesh")
+        self.assertEqual(state["conversion"]["matching"]["attempted"], 3)
+        self.assertEqual(state["conversion"]["matching"]["succeeded"], 2)
+        self.assertEqual(state["reconstruction_settings"]["voxel_size"], 0.04)
+        self.assertTrue(any(item["message"] == "历史日志" for item in state["logs"]))
+        elapsed = state["conversion"]["elapsed_seconds"]
+        time.sleep(0.03)
+        self.assertAlmostEqual(
+            self.controller.snapshot()["conversion"]["elapsed_seconds"],
+            elapsed,
+            places=3,
+        )
+        self.assertEqual(
+            self.controller.result_file("mesh"),
+            (self.dataset / "scene" / "integrated.ply").resolve(),
+        )
+        self.assertEqual(
+            self.controller.result_file("project"),
+            (self.dataset / PROJECT_FILENAME).resolve(),
+        )
+
+    def test_project_picker_opens_directory_without_copying(self) -> None:
+        write_reconstruction_project(self.dataset)
+        completed = subprocess.CompletedProcess(
+            args=["zenity"],
+            returncode=0,
+            stdout=f"{self.dataset}\n",
+            stderr="",
+        )
+        with (
+            mock.patch("open3d_reconstruct.web.sys.platform", "linux"),
+            mock.patch("open3d_reconstruct.web.IS_WSL", False),
+            mock.patch(
+                "open3d_reconstruct.web.shutil.which",
+                return_value="/usr/bin/zenity",
+            ),
+            mock.patch(
+                "open3d_reconstruct.web.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            state = self.controller.choose_local_project()
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(Path(state["dataset"]), self.dataset.resolve())
+        self.assertIn("--directory", run.call_args.args[0])
+
+
 class ControlCenterProcessTests(unittest.TestCase):
     def setUp(self) -> None:
         (ROOT / ".cache").mkdir(exist_ok=True)
@@ -792,6 +950,9 @@ else:
         )
         completed = wait_for(self.controller, "completed")
         self.assertTrue(completed["mesh"]["exists"])
+        self.assertIsNotNone(completed["project"])
+        self.assertEqual(completed["project_url"], "/api/files/project")
+        self.assertTrue((dataset / PROJECT_FILENAME).is_file())
         self.assertEqual(completed["hardware"], "d435i")
         self.assertEqual(completed["conversion"]["status"], "completed")
         self.assertEqual(completed["conversion"]["artifact"]["kind"], "model")
@@ -954,6 +1115,8 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn("连接并录制".encode(), page)
         self.assertIn("结束录制".encode(), page)
         self.assertIn("打开本地录制".encode(), page)
+        self.assertIn("打开重建工程".encode(), page)
+        self.assertIn("工程分析".encode(), page)
         self.assertIn("加载其他点云".encode(), page)
         self.assertIn("管理录制".encode(), page)
         self.assertIn("视频及全部产物".encode(), page)
@@ -1019,6 +1182,7 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"this.modelExtent", script)
         self.assertIn(b"mesh_preview_url", script)
         self.assertIn(b"/api/recording/select-local", script)
+        self.assertIn(b"/api/project/select-local", script)
         self.assertIn(b"/api/point-cloud/select-local", script)
         self.assertIn(b"fallbackToPoints", script)
         self.assertIn(b"/api/recordings/delete", script)
@@ -1031,6 +1195,7 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"processViewer.load", script)
         self.assertIn(b".camera-card", style)
         self.assertIn(b".conversion-controls", style)
+        self.assertIn(b".project-analysis", style)
         self.assertIn(b".process-activity.paused", style)
         self.assertIn(b".background-task-note", style)
         self.assertIn(b'.camera-card input[type="radio"]', style)
@@ -1125,6 +1290,26 @@ class WebHttpTests(unittest.TestCase):
         finally:
             if imported is not None:
                 imported.unlink(missing_ok=True)
+
+    def test_opened_project_configuration_can_be_downloaded(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="web-project-download-test-"
+        ) as temporary:
+            dataset = Path(temporary) / "dataset"
+            (dataset / "scene").mkdir(parents=True)
+            (dataset / "scene" / "integrated.ply").write_bytes(b"ply\nmesh")
+            manifest = write_reconstruction_project(
+                dataset,
+                conversion={"frame_count": 12, "status": "completed"},
+            )
+            self.controller.open_project(dataset)
+            payload, headers = self.get("/api/files/project")
+
+            self.assertEqual(json.loads(payload), manifest)
+            self.assertEqual(
+                headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertIn("attachment", headers["Content-Disposition"])
 
     def test_managed_recording_can_be_listed_selected_and_deleted(self) -> None:
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)

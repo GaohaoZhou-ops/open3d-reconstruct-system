@@ -35,6 +35,11 @@ from .paths import (
     RUNTIME_DIR,
     ensure_local_directories,
 )
+from .project import (
+    PROJECT_FILENAME,
+    load_reconstruction_project,
+    write_reconstruction_project,
+)
 from .service import (
     DEFAULT_SERVICE_PORT,
     SERVICE_NAME,
@@ -302,9 +307,10 @@ def _expose_picker_environment_to_windows(environment: dict[str, str]) -> None:
 def _native_file_picker(
     *,
     title: str,
-    extensions: tuple[str, ...],
+    extensions: tuple[str, ...] = (),
     initial_directory: Path | None = None,
     allow_all: bool = False,
+    select_directory: bool = False,
 ) -> str | None:
     picker_environment: dict[str, str] | None = None
     powershell = shutil.which("powershell.exe") or shutil.which("powershell")
@@ -317,14 +323,54 @@ def _native_file_picker(
                 HTTPStatus.NOT_IMPLEMENTED,
             )
         normalized = tuple(item.lstrip(".").lower() for item in extensions)
-        if not normalized or any(not item.isalnum() for item in normalized):
+        if not select_directory and (
+            not normalized or any(not item.isalnum() for item in normalized)
+        ):
             raise ValueError("Windows 文件类型过滤器无效")
         patterns = ";".join(f"*.{item}" for item in normalized)
         label = "PLY 点云与网格" if normalized == ("ply",) else "录制文件"
-        filters = f"{label} ({patterns})|{patterns}"
-        if allow_all:
+        filters = f"{label} ({patterns})|{patterns}" if patterns else ""
+        if allow_all and filters:
             filters += "|所有文件 (*.*)|*.*"
-        script = r"""
+        script = (r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$owner = $null
+$dialog = $null
+$exitCode = 2
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $owner = [System.Windows.Forms.Form]::new()
+    $owner.Width = 1
+    $owner.Height = 1
+    $owner.Opacity = 0
+    $owner.ShowInTaskbar = $false
+    $owner.TopMost = $true
+    $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $owner.Show()
+    $owner.Activate()
+
+    $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
+    $dialog.Description = $env:OPEN3D_RECONSTRUCT_PICKER_TITLE
+    $dialog.ShowNewFolderButton = $false
+    if ($env:OPEN3D_RECONSTRUCT_PICKER_INITIAL) {
+        $dialog.SelectedPath = $env:OPEN3D_RECONSTRUCT_PICKER_INITIAL
+    }
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        [Console]::WriteLine($dialog.SelectedPath)
+        $exitCode = 0
+    }
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    $exitCode = 1
+}
+finally {
+    if ($null -ne $dialog) { $dialog.Dispose() }
+    if ($null -ne $owner) { $owner.Close(); $owner.Dispose() }
+}
+exit $exitCode
+""" if select_directory else r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $owner = $null
@@ -372,7 +418,7 @@ finally {
     }
 }
 exit $exitCode
-""".strip()
+""").strip()
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         command = [
             picker,
@@ -400,10 +446,26 @@ exit $exitCode
                 HTTPStatus.NOT_IMPLEMENTED,
             )
         normalized = tuple(item.lstrip(".").lower() for item in extensions)
-        if not normalized or any(not item.isalnum() for item in normalized):
+        if not select_directory and (
+            not normalized or any(not item.isalnum() for item in normalized)
+        ):
             raise ValueError("macOS 文件类型过滤器无效")
         type_list = ", ".join(f'"{item}"' for item in normalized)
-        script = (
+        if select_directory:
+            script = (
+                "on run argv\n"
+                "set promptText to item 1 of argv\n"
+                + (
+                    "set startFolder to POSIX file (item 2 of argv)\n"
+                    "set selectedFolder to choose folder with prompt promptText "
+                    "default location startFolder\n"
+                    if initial_directory is not None
+                    else "set selectedFolder to choose folder with prompt promptText\n"
+                )
+                + "return POSIX path of selectedFolder\nend run"
+            )
+        else:
+            script = (
             "on run argv\n"
             "set promptText to item 1 of argv\n"
             + (
@@ -413,8 +475,8 @@ exit $exitCode
                 if initial_directory is not None
                 else f"set selectedFile to choose file with prompt promptText of type {{{type_list}}}\n"
             )
-            + "return POSIX path of selectedFile\nend run"
-        )
+                + "return POSIX path of selectedFile\nend run"
+            )
         command = [picker, "-e", script, title]
         if initial_directory is not None:
             command.append(str(initial_directory))
@@ -436,12 +498,15 @@ exit $exitCode
             "--file-selection",
             f"--title={title}",
         ]
+        if select_directory:
+            command.append("--directory")
         if initial_directory is not None:
             command.append(f"--filename={initial_directory}{os.sep}")
-        label = "PLY 点云与网格" if extensions == ("ply",) else "录制文件"
-        command.append(f"--file-filter={label} | {patterns}")
-        if allow_all:
-            command.append("--file-filter=所有文件 | *")
+        if not select_directory:
+            label = "PLY 点云与网格" if extensions == ("ply",) else "录制文件"
+            command.append(f"--file-filter={label} | {patterns}")
+            if allow_all:
+                command.append("--file-filter=所有文件 | *")
         cancel_codes = {1, 5}
     try:
         run_options: dict[str, Any] = {}
@@ -769,6 +834,7 @@ class ControlCenter:
         self._dataset: Path | None = None
         self._mesh: Path | None = None
         self._loaded_point_cloud: Path | None = None
+        self._project: dict[str, Any] | None = None
         self._error: str | None = None
         self._recording_started_at: str | None = None
         self._recording_finished_at: str | None = None
@@ -1379,6 +1445,7 @@ class ControlCenter:
             self._dataset = dataset
             self._mesh = dataset / "scene" / "integrated.ply"
             self._loaded_point_cloud = None
+            self._project = None
             self._error = None
             self._recording_started_at = None
             self._recording_finished_at = None
@@ -1545,6 +1612,7 @@ class ControlCenter:
         self._dataset = dataset.absolute()
         self._mesh = self._dataset / "scene" / "integrated.ply"
         self._loaded_point_cloud = None
+        self._project = None
         self._error = None
         self._recording_started_at = None
         try:
@@ -1683,6 +1751,207 @@ class ControlCenter:
             if selected is None:
                 return None
             return self.reference_local_recording(selected, hardware=hardware)
+        finally:
+            self._file_picker_lock.release()
+
+    @staticmethod
+    def _project_summary(
+        manifest: dict[str, Any], path: Path, *, opened: bool
+    ) -> dict[str, Any]:
+        reconstruction = manifest.get("reconstruction")
+        if not isinstance(reconstruction, dict):
+            reconstruction = {}
+        analysis = manifest.get("web_analysis")
+        if not isinstance(analysis, dict):
+            analysis = {}
+        matching = analysis.get("matching")
+        if not isinstance(matching, dict):
+            matching = {}
+        compute = reconstruction.get("compute")
+        if not isinstance(compute, dict):
+            compute = {}
+        return {
+            "path": _display_path(path),
+            "filename": path.name,
+            "opened": opened,
+            "created_at": manifest.get("created_at"),
+            "updated_at": manifest.get("updated_at"),
+            "format_version": manifest.get("format_version"),
+            "frame_count": reconstruction.get("frame_count"),
+            "stages": list(reconstruction.get("stages") or []),
+            "timings_seconds": dict(reconstruction.get("timings_seconds") or {}),
+            "total_seconds": reconstruction.get("total_seconds"),
+            "compute": compute,
+            "settings": dict(reconstruction.get("settings") or {}),
+            "matching": {
+                key: matching.get(key)
+                for key in ("expected", "attempted", "succeeded", "failed")
+            },
+            "artifact_count": len(manifest.get("artifacts") or {}),
+        }
+
+    def _persist_completed_project_locked(self) -> None:
+        dataset = self._dataset
+        if dataset is None or not dataset.is_dir() or not _is_nonempty_file(self._mesh):
+            return
+        try:
+            manifest = write_reconstruction_project(
+                dataset,
+                recording=self._recording,
+                hardware=self._hardware,
+                started_at=self._conversion_started_at,
+                finished_at=self._conversion_finished_at,
+                settings=self._reconstruction_settings,
+                conversion=self._process_snapshot_locked(),
+                logs=list(self._logs),
+            )
+            project_path = dataset / PROJECT_FILENAME
+            self._project = self._project_summary(
+                manifest, project_path, opened=False
+            )
+            self._append_log(
+                f"重建工程配置已保存：{_display_path(project_path)}。",
+                level="success",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._project = None
+            self._append_log(
+                f"最终模型已生成，但工程配置保存失败：{exc}",
+                level="error",
+            )
+
+    def open_project(self, path: object) -> dict[str, Any]:
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            raise WebActionError("未选择重建工程目录", HTTPStatus.BAD_REQUEST)
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+        try:
+            loaded = load_reconstruction_project(Path(raw_path))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise WebActionError(
+                f"无法打开重建工程：{exc}", HTTPStatus.BAD_REQUEST
+            ) from exc
+
+        reconstruction = loaded["reconstruction"]
+        analysis = dict(loaded["analysis"])
+        matching = analysis.pop("matching", {})
+        now = time.monotonic()
+        elapsed = max(0.0, float(analysis.get("elapsed_seconds") or 0.0))
+        stage_elapsed = max(
+            0.0, float(analysis.get("stage_elapsed_seconds") or elapsed)
+        )
+        analysis.update(
+            stage="complete",
+            stage_index=len(PIPELINE_STEPS),
+            stage_count=len(PIPELINE_STEPS),
+            label="重建完成",
+            status="completed",
+            detail="已从工程配置恢复重建结果与分析数据",
+            frame_count=(
+                analysis.get("frame_count") or reconstruction.get("frame_count")
+            ),
+            settings=dict(reconstruction.get("settings") or {}),
+            _started_monotonic=now - elapsed,
+            _stage_started_monotonic=now - stage_elapsed,
+            _last_output_monotonic=now,
+            _finished_monotonic=now,
+            _matching_events=list(
+                (matching.get("events") or [])
+                if isinstance(matching, dict)
+                else []
+            ),
+            _matching_active={},
+            _matching_seen=set(),
+            _matching_attempted=int(
+                matching.get("attempted") or 0
+                if isinstance(matching, dict)
+                else 0
+            ),
+            _matching_succeeded=int(
+                matching.get("succeeded") or 0
+                if isinstance(matching, dict)
+                else 0
+            ),
+            _matching_failed=int(
+                matching.get("failed") or 0
+                if isinstance(matching, dict)
+                else 0
+            ),
+            _matching_information_max=float(
+                matching.get("information_max") or 0.0
+                if isinstance(matching, dict)
+                else 0.0
+            ),
+            _matching_last=(
+                matching.get("last") if isinstance(matching, dict) else None
+            ),
+            _matching_expected=(
+                matching.get("expected") if isinstance(matching, dict) else None
+            ),
+        )
+        hardware = str(loaded.get("hardware") or "")
+        recording = loaded.get("recording")
+        if hardware not in HARDWARE:
+            if isinstance(recording, Path) and recording.suffix.lower() == ".mkv":
+                hardware = "azure-kinect"
+            elif isinstance(recording, Path) and recording.suffix.lower() == ".bag":
+                hardware = "d435"
+            else:
+                hardware = ""
+
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+            self._generation += 1
+            self._logs.clear()
+            for item in loaded["logs"]:
+                self._logs.append(dict(item))
+            self._phase = "completed"
+            self._hardware = hardware or None
+            self._device = 0
+            self._recording = recording
+            self._dataset = loaded["dataset"]
+            self._mesh = loaded["mesh"]
+            self._loaded_point_cloud = None
+            self._error = None
+            self._recording_started_at = None
+            self._recording_finished_at = None
+            self._conversion_started_at = reconstruction.get("started_at")
+            self._conversion_finished_at = reconstruction.get("finished_at")
+            self._conversion_progress = analysis
+            self._reconstruction_settings = dict(
+                reconstruction.get("settings") or {}
+            )
+            self._reset_conversion_control_locked()
+            self._project = self._project_summary(
+                loaded["manifest"], loaded["path"], opened=True
+            )
+            self._discard_live_dir_locked()
+            self._append_log(
+                f"已打开重建工程：{_display_path(loaded['dataset'])}。",
+                level="success",
+            )
+            self._touch_locked()
+            return self._snapshot_locked()
+
+    def choose_local_project(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self._process is not None or self._task is not None:
+                raise WebActionError("已有任务正在运行，请等待它结束")
+            initial_directory = self._dataset if self._dataset else DATASETS_DIR
+        if not self._file_picker_lock.acquire(blocking=False):
+            raise WebActionError("本地文件选择窗口已经打开")
+        try:
+            selected = _native_file_picker(
+                title="选择 Open3D 重建工程目录",
+                initial_directory=initial_directory,
+                select_directory=True,
+            )
+            if selected is None:
+                return None
+            return self.open_project(selected)
         finally:
             self._file_picker_lock.release()
 
@@ -1946,6 +2215,8 @@ class ControlCenter:
 
     def _finish_conversion_locked(self, returncode: int) -> None:
         self._conversion_finished_at = _now_iso()
+        if self._conversion_progress is not None:
+            self._conversion_progress["_finished_monotonic"] = time.monotonic()
         cancelled = self._conversion_cancel_requested
         self._reset_conversion_control_locked()
         if cancelled:
@@ -1990,6 +2261,7 @@ class ControlCenter:
                     total=self._conversion_progress.get("frame_count"),
                 )
             self._append_log("RGB-D 提取与四阶段重建完成。", level="success")
+            self._persist_completed_project_locked()
             return
         self._phase = "error"
         if self._conversion_progress is not None:
@@ -2026,6 +2298,7 @@ class ControlCenter:
             self._dataset = dataset
             self._mesh = dataset / "scene" / "integrated.ply"
             self._loaded_point_cloud = None
+            self._project = None
             self._error = None
             self._recording_started_at = _now_iso()
             self._recording_finished_at = None
@@ -2430,6 +2703,7 @@ class ControlCenter:
             self._conversion_finished_at = None
             self._mesh = self._dataset / "scene" / "integrated.ply"
             self._loaded_point_cloud = None
+            self._project = None
             self._reconstruction_settings = {
                 "stride": stride_value,
                 **parameter_values,
@@ -2579,7 +2853,8 @@ class ControlCenter:
         progress = dict(self._conversion_progress)
         stage = progress.get("stage")
         clock_now = time.monotonic()
-        now = self._conversion_paused_monotonic or clock_now
+        finished_monotonic = progress.pop("_finished_monotonic", None)
+        now = self._conversion_paused_monotonic or finished_monotonic or clock_now
         started = float(progress.pop("_started_monotonic", now))
         stage_started = float(progress.pop("_stage_started_monotonic", started))
         last_output = float(progress.pop("_last_output_monotonic", started))
@@ -2729,6 +3004,7 @@ class ControlCenter:
             "dataset": _display_path(self._dataset),
             "mesh": mesh,
             "loaded_point_cloud": loaded_point_cloud,
+            "project": dict(self._project) if self._project is not None else None,
             "recording_started_at": self._recording_started_at,
             "recording_finished_at": self._recording_finished_at,
             "conversion_started_at": self._conversion_started_at,
@@ -2738,6 +3014,7 @@ class ControlCenter:
             "recording_import": import_progress,
             "can_start_recording": not busy,
             "can_import_recording": not busy,
+            "can_open_project": not busy,
             "can_stop_recording": process is not None and self._task == "record" and self._phase == "recording",
             "can_start_conversion": not busy and recording_ready,
             "can_pause_conversion": process is not None and self._task == "convert" and self._phase == "converting",
@@ -2747,6 +3024,9 @@ class ControlCenter:
             "recording_url": "/api/files/recording" if recording_ready else None,
             "mesh_url": "/api/files/mesh" if mesh_ready else None,
             "mesh_preview_url": "/api/files/mesh-preview" if mesh_ready else None,
+            "project_url": (
+                "/api/files/project" if self._project is not None else None
+            ),
             "loaded_point_cloud_url": (
                 "/api/files/point-cloud" if loaded_point_cloud_ready else None
             ),
@@ -2806,16 +3086,26 @@ class ControlCenter:
                 path = self._recording
             elif kind == "point-cloud":
                 path = self._loaded_point_cloud
+            elif kind == "project":
+                path = self._dataset / PROJECT_FILENAME if self._dataset else None
             else:
                 return None
             if not _is_nonempty_file(path):
                 return None
             assert path is not None
             try:
-                if kind == "mesh":
-                    path.resolve().relative_to(ROOT.resolve())
+                if kind in {"mesh", "project"}:
+                    base = (
+                        self._dataset.resolve()
+                        if self._dataset is not None
+                        else ROOT.resolve()
+                    )
+                    path.resolve().relative_to(base)
                 elif kind == "recording":
-                    path.absolute().relative_to(RECORDINGS_DIR.resolve())
+                    if self._project is None:
+                        path.absolute().relative_to(RECORDINGS_DIR.resolve())
+                    elif path.suffix.lower() not in {".mkv", ".bag"}:
+                        return None
                 elif path.suffix.lower() not in POINT_CLOUD_SUFFIXES:
                     return None
             except ValueError:
@@ -3243,7 +3533,11 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 self._error(HTTPStatus.NOT_FOUND, "文件尚未生成或已不存在")
                 return
             inline_kinds = {"mesh", "mesh-preview", "point-cloud"}
-            content_type = "model/ply" if kind in inline_kinds else "application/octet-stream"
+            content_type = (
+                "model/ply"
+                if kind in inline_kinds
+                else ("application/json; charset=utf-8" if kind == "project" else "application/octet-stream")
+            )
             size = path.stat().st_size
             self.send_response(HTTPStatus.OK)
             self._headers(content_type, size, cache="no-store")
@@ -3395,6 +3689,8 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 self._send_file("mesh-preview")
             elif parsed.path == "/api/files/point-cloud":
                 self._send_file("point-cloud")
+            elif parsed.path == "/api/files/project":
+                self._send_file("project")
             else:
                 self._error(HTTPStatus.NOT_FOUND, "页面不存在")
 
@@ -3426,6 +3722,16 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                     selected = controller.choose_local_recording(
                         hardware=body.get("hardware")
                     )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "cancelled": selected is None,
+                            "state": selected or controller.snapshot(),
+                        }
+                    )
+                    return
+                if parsed.path == "/api/project/select-local":
+                    selected = controller.choose_local_project()
                     self._send_json(
                         {
                             "ok": True,

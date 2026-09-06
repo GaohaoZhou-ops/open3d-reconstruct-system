@@ -238,6 +238,12 @@ Windows、WSL2 与 macOS 上“打开本地录制”和“加载其他点云”�
    继续重建”和“终止重建”；暂停会冻结完整计算进程树并保留内存状态，继续后从同一位置
    运行。暂停不会释放已经占用的内存或显存；需要释放这些资源时应终止任务。停止后台
    服务或在前台终端按 `Ctrl+C` 会把重建视为放弃，但不会删除 MKV/BAG 录制。
+   成功完成后，数据集根目录会原子写入 `open3d-project.json`。该工程配置使用相对路径
+   索引 RGB-D 数据、内参、轨迹、位姿图和最终模型，并保存重建参数、计算后端、阶段
+   耗时、帧对匹配统计与事件、暂停统计及 Web 日志。点击“打开重建工程”可直接选择整个
+   数据集目录，恢复模型与工程分析；没有该配置的旧版完整数据集会在首次打开时自动识别
+   并补建。工程目录可以整体移动，但目录外的原始录制只有在原路径或相对路径仍可访问时
+   才会显示下载入口。
 4. 完成后可在页面切换点云、彩色面或强调几何起伏的结构面预览。也可以随时点击
    “加载其他点云”选择本机 `.ply`：文件窗口优先打开当前数据集的 `scene/` 结果目录，
    没有当前数据集时打开 `data/datasets/`，并只显示 `.ply/.PLY` 文件；后端还会校验
@@ -341,6 +347,7 @@ data/datasets/first-scan/fragments/
 data/datasets/first-scan/scene/integrated.ply
 data/datasets/first-scan/scene/trajectory.log
 data/datasets/first-scan/run-report.json
+data/datasets/first-scan/open3d-project.json
 ```
 
 `integrated.ply` 是最终带顶点颜色的三角网格。

@@ -95,6 +95,7 @@
             <button id="open-recording" class="action import" type="button" title="直接引用 MKV/BAG，不复制视频数据"><i class="open-icon"></i><span id="open-recording-label">打开本地录制</span></button>
             <button id="manage-recordings" class="action manage" type="button" title="管理已经落盘的录制和重建产物"><i class="manage-icon"></i><span>管理录制</span></button>
           </div>
+          <button id="open-project" class="action project" type="button" title="打开包含 open3d-project.json 的重建目录；旧数据集会自动识别"><i class="project-icon"></i><span id="open-project-label">打开重建工程</span></button>
           <button id="open-point-cloud" class="action point-cloud" type="button" title="仅选择 PLY，默认打开当前数据集的 scene 目录"><i class="point-cloud-icon"></i><span id="open-point-cloud-label">加载其他点云</span></button>
           <button id="start-conversion" class="action convert" type="button" disabled><i class="convert-icon"></i><span>开始重建</span></button>
           <div id="conversion-controls" class="conversion-controls" hidden>
@@ -245,10 +246,24 @@
           </div>
           <div class="result-links">
             <a id="download-mesh" class="download-link" href="/api/files/mesh" download>下载 PLY</a>
+            <a id="download-project" class="text-link" href="/api/files/project" download hidden>工程配置</a>
             <button id="close-loaded-point-cloud" class="text-link" type="button" hidden>返回重建结果</button>
             <a id="download-recording" class="text-link" href="/api/files/recording">下载原始录制</a>
           </div>
         </div>
+        <section id="project-analysis" class="project-analysis" aria-labelledby="project-analysis-title" hidden>
+          <header>
+            <div><small>RECONSTRUCTION PROJECT</small><strong id="project-analysis-title">工程分析</strong></div>
+            <code id="project-file">open3d-project.json</code>
+          </header>
+          <dl>
+            <div><dt>RGB-D 帧</dt><dd id="project-frame-count">—</dd></div>
+            <div><dt>总耗时</dt><dd id="project-duration">—</dd></div>
+            <div><dt>计算后端</dt><dd id="project-compute">—</dd></div>
+            <div><dt>帧对匹配</dt><dd id="project-matching">—</dd></div>
+            <div class="project-stages"><dt>完成阶段</dt><dd id="project-stages">—</dd></div>
+          </dl>
+        </section>
         <div class="viewer-wrap">
           <canvas id="model-viewer" aria-label="重建模型预览"></canvas>
           <canvas id="model-mesh-viewer" aria-label="重建三角网格预览" hidden></canvas>

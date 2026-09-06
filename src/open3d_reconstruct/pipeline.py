@@ -4,12 +4,14 @@ import importlib
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from .compute import configure_compute_backend
 from .configuration import write_json
 from .paths import VENDOR_RECONSTRUCTION_DIR
+from .project import write_reconstruction_project
 
 
 STAGES = ("make", "register", "refine", "integrate", "slac", "slac-integrate")
@@ -172,6 +174,16 @@ def run_pipeline(config: dict[str, Any], stages: Iterable[str]) -> Path | None:
         if len(mesh.vertices) == 0:
             raise RuntimeError("生成的网格没有顶点；请检查深度范围、图像和相机轨迹")
     write_json(dataset / "run-report.json", result)
+    if mesh_path.is_file():
+        write_reconstruction_project(
+            dataset,
+            finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            settings={
+                key: value
+                for key, value in config.items()
+                if key not in {"path_dataset", "path_intrinsic"}
+            },
+        )
 
     print("\n重建阶段全部完成。")
     for stage, elapsed in timings.items():
