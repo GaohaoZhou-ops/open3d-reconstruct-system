@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http import HTTPStatus
 from pathlib import Path
 from unittest import mock
 
@@ -632,6 +633,7 @@ class ControlCenterProcessTests(unittest.TestCase):
         self.launcher.write_text(
             f"""#!{python}
 import signal
+import subprocess
 import sys
 import time
 import os
@@ -654,9 +656,38 @@ if args[0] == "record":
             finish(None, None)
         time.sleep(0.05)
 elif args[0] == "reconstruct":
+    source = Path(args[1])
     dataset = Path(args[args.index("--dataset") + 1])
     scene = dataset / "scene"
     scene.mkdir(parents=True, exist_ok=True)
+    if source.stem.startswith("web-control-"):
+        def abandon(_signum, _frame):
+            print("fake reconstruction terminated", flush=True)
+            raise SystemExit(143)
+        signal.signal(signal.SIGTERM, abandon)
+        print("[1/5] 提取 RGB-D 帧", flush=True)
+        worker_counter = dataset / "worker.count"
+        worker_code = (
+            "import sys,time\\n"
+            "from pathlib import Path\\n"
+            "path=Path(sys.argv[1]); count=0\\n"
+            "while True:\\n"
+            " count += 1\\n"
+            " path.write_text(str(count), encoding='ascii')\\n"
+            " time.sleep(0.03)\\n"
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-u", "-c", worker_code, str(worker_counter)]
+        )
+        count = 0
+        try:
+            while not (dataset / "finish.requested").is_file():
+                count += 1
+                print(f"已提取 {{count}} 帧……", flush=True)
+                time.sleep(0.04)
+        finally:
+            worker.terminate()
+            worker.wait(timeout=5)
     (scene / "integrated.ply").write_text(
         "ply\\nformat ascii 1.0\\nelement vertex 3\\n"
         "property float x\\nproperty float y\\nproperty float z\\n"
@@ -681,6 +712,40 @@ else:
             elif path.exists():
                 path.unlink()
         self.temporary.cleanup()
+
+    def start_slow_conversion(self) -> tuple[Path, Path]:
+        name = f"web-control-{uuid.uuid4().hex}"
+        state = self.controller.start_recording(
+            hardware="d435i", device=0, name=name
+        )
+        recording = ROOT / state["recording"]["path"]
+        dataset = ROOT / state["dataset"]
+        self.created_paths.extend((recording, dataset))
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(
+                "fake recording ready" in line["message"]
+                for line in self.controller.snapshot()["logs"]
+            ):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("伪录制进程没有准备好")
+
+        self.controller.stop_recording()
+        wait_for(self.controller, "recorded")
+        self.controller.start_conversion(stride=1)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            progress = self.controller.snapshot()["conversion"] or {}
+            if (
+                int(progress.get("processed") or 0) >= 3
+                and (dataset / "worker.count").is_file()
+            ):
+                return recording, dataset
+            time.sleep(0.02)
+        self.fail("伪重建进程没有产生进度")
 
     def test_record_stop_then_convert_state_machine(self) -> None:
         name = f"web-unit-{uuid.uuid4().hex}"
@@ -762,6 +827,93 @@ else:
         self.assertTrue(stopped["recording"]["exists"])
         self.assertGreater(stopped["recording"]["size"], 0)
 
+    def test_conversion_pause_survives_browser_reconnect_and_resumes(self) -> None:
+        recording, dataset = self.start_slow_conversion()
+        paused = self.controller.pause_conversion()
+        self.assertEqual(paused["phase"], "paused")
+        self.assertTrue(paused["can_resume_conversion"])
+        self.assertTrue(paused["can_stop_conversion"])
+        self.assertEqual(paused["conversion"]["status"], "paused")
+        task_pid = paused["pid"]
+
+        server = create_server(self.controller, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            time.sleep(0.15)
+            with urllib.request.urlopen(base + "/api/state", timeout=5) as response:
+                first = json.loads(response.read())["state"]
+            time.sleep(0.2)
+            with urllib.request.urlopen(base + "/api/state", timeout=5) as response:
+                reopened = json.loads(response.read())["state"]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(reopened["phase"], "paused")
+        self.assertEqual(reopened["pid"], task_pid)
+        self.assertEqual(
+            reopened["conversion"]["processed"],
+            first["conversion"]["processed"],
+        )
+        self.assertAlmostEqual(
+            reopened["conversion"]["elapsed_seconds"],
+            first["conversion"]["elapsed_seconds"],
+            delta=0.05,
+        )
+        self.assertGreater(reopened["conversion"]["paused_total_seconds"], 0.25)
+        self.assertGreaterEqual(len(reopened["logs"]), len(first["logs"]))
+        worker_counter = dataset / "worker.count"
+        self.assertTrue(worker_counter.is_file())
+        worker_value = worker_counter.read_text(encoding="ascii")
+        time.sleep(0.15)
+        self.assertEqual(
+            worker_counter.read_text(encoding="ascii"), worker_value
+        )
+
+        resumed = self.controller.resume_conversion()
+        self.assertEqual(resumed["phase"], "converting")
+        self.assertEqual(resumed["conversion"]["status"], "running")
+        frozen_count = int(resumed["conversion"]["processed"] or 0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = self.controller.snapshot()
+            if int(current["conversion"]["processed"] or 0) > frozen_count:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("伪重建进程继续后没有恢复进度")
+
+        (dataset / "finish.requested").touch()
+        completed = wait_for(self.controller, "completed")
+        self.assertTrue(recording.is_file())
+        self.assertEqual(completed["conversion"]["pause_count"], 1)
+        self.assertGreater(completed["conversion"]["paused_total_seconds"], 0.25)
+
+    def test_conversion_can_be_terminated_without_deleting_recording(self) -> None:
+        recording, _dataset = self.start_slow_conversion()
+        self.controller.pause_conversion()
+        stopping = self.controller.stop_conversion()
+        self.assertIn(stopping["phase"], {"cancelling", "recorded"})
+
+        stopped = wait_for(self.controller, "recorded")
+        self.assertTrue(recording.is_file())
+        self.assertGreater(recording.stat().st_size, 0)
+        self.assertEqual(stopped["conversion"]["status"], "cancelled")
+        self.assertTrue(stopped["can_start_conversion"])
+        self.assertIsNone(stopped["error"])
+
+    def test_controller_shutdown_abandons_conversion_but_keeps_recording(self) -> None:
+        recording, _dataset = self.start_slow_conversion()
+        self.controller.pause_conversion()
+        self.controller.close()
+
+        stopped = wait_for(self.controller, "recorded")
+        self.assertTrue(recording.is_file())
+        self.assertEqual(stopped["conversion"]["status"], "cancelled")
+
 
 class WebHttpTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -777,8 +929,8 @@ class WebHttpTests(unittest.TestCase):
         self.controller.close()
         self.thread.join(timeout=2)
 
-    def get(self, path: str) -> tuple[bytes, dict]:
-        with urllib.request.urlopen(self.base + path, timeout=5) as response:
+    def get(self, path: str, *, timeout: float = 5) -> tuple[bytes, dict]:
+        with urllib.request.urlopen(self.base + path, timeout=timeout) as response:
             return response.read(), dict(response.headers)
 
     def post_json(self, path: str, value: dict) -> dict:
@@ -807,6 +959,10 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn("视频及全部产物".encode(), page)
         self.assertNotIn(b'id="recording-file"', page)
         self.assertIn("开始重建".encode(), page)
+        self.assertIn("暂停重建".encode(), page)
+        self.assertIn("终止重建".encode(), page)
+        self.assertIn("后台任务已托管".encode(), page)
+        self.assertIn(b'id="stop-conversion-dialog"', page)
         self.assertIn("运动数据".encode(), page)
         self.assertIn("确认重建参数".encode(), page)
         self.assertIn("查看参数".encode(), page)
@@ -837,8 +993,15 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"live-rgb-buffer", page)
         self.assertIn(b"live-depth-buffer", page)
         self.assertIn(b"/api/record/start", script)
+        self.assertIn(b"/api/convert/pause", script)
+        self.assertIn(b"/api/convert/resume", script)
+        self.assertIn(b"/api/convert/stop", script)
+        self.assertNotIn(b"beforeunload", script)
+        self.assertNotIn(b"pagehide", script)
         self.assertIn(b"/api/live/state", script)
         self.assertIn(b"class LiveFrameBuffer", script)
+        self.assertIn(b"version === this.loadingVersion", script)
+        self.assertIn(b"version === this.pending?.version", script)
         self.assertIn(b"class ImuOrientation", script)
         self.assertIn(b"class MatchingDiagnostics", script)
         self.assertIn(b"class ViewerOrientation", script)
@@ -867,11 +1030,39 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"preference_loop_closure_registration", script)
         self.assertIn(b"processViewer.load", script)
         self.assertIn(b".camera-card", style)
+        self.assertIn(b".conversion-controls", style)
+        self.assertIn(b".process-activity.paused", style)
+        self.assertIn(b".background-task-note", style)
+        self.assertIn(b'.camera-card input[type="radio"]', style)
+        self.assertIn(b"clip-path: inset(50%)", style)
+        self.assertIn(b'input:not([type="radio"]):disabled', style)
+        self.assertNotIn(b"input:disabled, select:disabled", style)
         self.assertIn(b".capture-visual", style)
         self.assertIn(b".live-frame.active", style)
+        self.assertNotIn(b"visibility: hidden; transition: opacity", style)
         self.assertIn(b".viewer-navigation", style)
         self.assertIn(b".viewer-scale-bar", style)
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
+
+    def test_conversion_controls_reject_requests_without_active_task(self) -> None:
+        for path in (
+            "/api/convert/pause",
+            "/api/convert/resume",
+            "/api/convert/stop",
+        ):
+            request = urllib.request.Request(
+                self.base + path,
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Open3D-Reconstruct": "web",
+                },
+                method="POST",
+            )
+            with self.subTest(path=path):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(raised.exception.code, HTTPStatus.CONFLICT)
 
     def test_selected_point_cloud_can_be_streamed_and_cleared(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1066,7 +1257,9 @@ class WebHttpTests(unittest.TestCase):
             with mock.patch(
                 "open3d_reconstruct.web.MESH_PREVIEW_TARGET_TRIANGLES", 1
             ):
-                preview_payload, headers = self.get("/api/files/mesh-preview")
+                preview_payload, headers = self.get(
+                    "/api/files/mesh-preview", timeout=30
+                )
             preview_lines = preview_payload.splitlines()
             self.assertEqual(preview_lines[0], b"ply")
             self.assertIn(b"element face 1", preview_lines)

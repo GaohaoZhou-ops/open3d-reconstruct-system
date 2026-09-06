@@ -48,7 +48,7 @@ class LivePreviewTests(unittest.TestCase):
             self.assertTrue(
                 publisher.publish_arrays(color, depth, frame_count=7, force=True)
             )
-            state = json.loads((directory / "state.json").read_text())
+            state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["sequence"], 1)
             self.assertEqual(state["frame_count"], 7)
             self.assertTrue(state["imu"]["available"])
@@ -59,7 +59,7 @@ class LivePreviewTests(unittest.TestCase):
             self.assertFalse(list(directory.glob("*.tmp")))
 
             publisher.close(frame_count=7)
-            closed = json.loads((directory / "state.json").read_text())
+            closed = json.loads((directory / "state.json").read_text(encoding="utf-8"))
             self.assertFalse(closed["active"])
 
     def test_existing_camera_jpeg_is_published_without_reencoding(self) -> None:
@@ -86,7 +86,9 @@ class LivePreviewTests(unittest.TestCase):
                 )
             )
             self.assertEqual((publisher.directory / "rgb.jpg").read_bytes(), jpeg)
-            state = json.loads((publisher.directory / "state.json").read_text())
+            state = json.loads(
+                (publisher.directory / "state.json").read_text(encoding="utf-8")
+            )
             self.assertTrue(state["rgb"]["passthrough"])
             self.assertEqual(state["preview_target_fps"], 15)
             self.assertGreaterEqual(state["preview_processing_ms"], 0)
@@ -131,8 +133,12 @@ class LivePreviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             d435 = LivePreviewPublisher(Path(temporary) / "d435", hardware="d435")
             d435i = LivePreviewPublisher(Path(temporary) / "d435i", hardware="d435i")
-            d435_state = json.loads((d435.directory / "state.json").read_text())
-            d435i_state = json.loads((d435i.directory / "state.json").read_text())
+            d435_state = json.loads(
+                (d435.directory / "state.json").read_text(encoding="utf-8")
+            )
+            d435i_state = json.loads(
+                (d435i.directory / "state.json").read_text(encoding="utf-8")
+            )
             self.assertFalse(d435_state["imu"]["supported"])
             self.assertTrue(d435i_state["imu"]["supported"])
             self.assertFalse(d435i_state["imu"]["available"])

@@ -34,8 +34,11 @@ if ($ProjectRoot.StartsWith("\\")) {
         "路径（例如 C:\src\open3d-reconstruct-system），再运行 .\setup.ps1。"
     )
 }
-$Architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-if ($Architecture -ne [Runtime.InteropServices.Architecture]::X64) {
+$Architecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
+if ([string]::IsNullOrWhiteSpace($Architecture)) {
+    $Architecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+}
+if (-not [Environment]::Is64BitOperatingSystem -or $Architecture -ne "AMD64") {
     throw "不支持的 Windows 架构: $Architecture（当前仅支持 Windows x64）。"
 }
 

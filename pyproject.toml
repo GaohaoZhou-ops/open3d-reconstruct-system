@@ -18,6 +18,9 @@ dependencies = [
     "numpy==1.26.4",
     "open3d==0.19.0",
     "opencv-python-headless==4.10.0.84",
+    # Used to suspend and resume the complete reconstruction process tree on
+    # Windows, where POSIX process-group signals are unavailable.
+    "psutil==7.2.2",
     # One tensor implementation serves NVIDIA CUDA on Linux and Metal/MPS on
     # Apple Silicon. Intel macOS and Windows use the Open3D CPU path.
     "torch==2.14.0; sys_platform == 'linux' or (sys_platform == 'darwin' and platform_machine == 'arm64')",

@@ -97,6 +97,10 @@
           </div>
           <button id="open-point-cloud" class="action point-cloud" type="button" title="仅选择 PLY，默认打开当前数据集的 scene 目录"><i class="point-cloud-icon"></i><span id="open-point-cloud-label">加载其他点云</span></button>
           <button id="start-conversion" class="action convert" type="button" disabled><i class="convert-icon"></i><span>开始重建</span></button>
+          <div id="conversion-controls" class="conversion-controls" hidden>
+            <button id="toggle-conversion" class="action pause" type="button" disabled><i class="pause-icon"></i><span id="toggle-conversion-label">暂停重建</span></button>
+            <button id="stop-conversion" class="action danger" type="button" disabled><i class="stop-icon"></i><span>终止重建</span></button>
+          </div>
         </div>
 
         <div id="task-summary" class="task-summary" aria-live="polite">
@@ -173,6 +177,10 @@
             <i aria-hidden="true"></i>
             <div><strong id="process-activity-title">后端进程正在运行</strong><small id="process-activity-detail">正在等待第一条进度信息</small></div>
             <time id="process-elapsed">00:00</time>
+          </div>
+          <div id="background-task-note" class="background-task-note" role="note">
+            <span aria-hidden="true">BG</span>
+            <div><strong id="background-task-title">后台任务已托管</strong><small id="background-task-detail">可以安全关闭网页；重新打开后会恢复当前进度、统计和日志。</small></div>
           </div>
           <div id="conversion-content" class="conversion-content">
             <div id="conversion-placeholder" class="conversion-placeholder">正在准备可视化内容…</div>
@@ -325,6 +333,24 @@
         <button id="cancel-delete-recording" class="dialog-secondary" type="button">取消</button>
         <button id="delete-recording-only" class="delete-video-only" type="button">仅删除视频</button>
         <button id="delete-recording-all" class="delete-video-all" type="button">视频及全部产物</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog id="stop-conversion-dialog" class="stop-conversion-dialog" aria-labelledby="stop-conversion-title">
+    <div class="stop-conversion-shell">
+      <header class="dialog-heading">
+        <div><span class="delete-warning">!</span><div><h2 id="stop-conversion-title">终止当前重建？</h2><p class="error">当前重建进程会被结束，无法从同一计算位置继续。</p></div></div>
+        <button id="close-stop-conversion" class="dialog-close" type="button" aria-label="关闭">×</button>
+      </header>
+      <div class="stop-conversion-preservation">
+        <strong>原始录制会保留</strong>
+        <p>MKV/BAG 不会被删除，之后仍可重新开始重建。已经生成的中间文件也不会由此按钮主动清理。</p>
+      </div>
+      <p class="delete-recording-note">如果只是暂时需要释放 CPU/GPU 计算时间，请选择“取消”，再使用“暂停重建”。</p>
+      <footer class="dialog-actions">
+        <button id="cancel-stop-conversion" class="dialog-secondary" type="button">取消</button>
+        <button id="confirm-stop-conversion" class="stop-conversion-confirm" type="button">确认终止</button>
       </footer>
     </div>
   </dialog>

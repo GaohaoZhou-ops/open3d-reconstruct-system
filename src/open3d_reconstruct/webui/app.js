@@ -22,6 +22,10 @@ const elements = {
   openPointCloud: $("#open-point-cloud"),
   openPointCloudLabel: $("#open-point-cloud-label"),
   startConversion: $("#start-conversion"),
+  conversionControls: $("#conversion-controls"),
+  toggleConversion: $("#toggle-conversion"),
+  toggleConversionLabel: $("#toggle-conversion-label"),
+  stopConversion: $("#stop-conversion"),
   phaseBadge: $("#phase-badge"),
   taskSummary: $("#task-summary"),
   errorBanner: $("#error-banner"),
@@ -67,6 +71,9 @@ const elements = {
   processActivityTitle: $("#process-activity-title"),
   processActivityDetail: $("#process-activity-detail"),
   processElapsed: $("#process-elapsed"),
+  backgroundTaskNote: $("#background-task-note"),
+  backgroundTaskTitle: $("#background-task-title"),
+  backgroundTaskDetail: $("#background-task-detail"),
   conversionContent: $("#conversion-content"),
   conversionPlaceholder: $("#conversion-placeholder"),
   matchingDiagnostics: $("#matching-diagnostics"),
@@ -127,6 +134,10 @@ const elements = {
   deleteRecordingMessage: $("#delete-recording-message"),
   deleteRecordingArtifacts: $("#delete-recording-artifacts"),
   deleteRecordingNote: $("#delete-recording-note"),
+  stopConversionDialog: $("#stop-conversion-dialog"),
+  closeStopConversion: $("#close-stop-conversion"),
+  cancelStopConversion: $("#cancel-stop-conversion"),
+  confirmStopConversion: $("#confirm-stop-conversion"),
   reconstructionDialog: $("#reconstruction-dialog"),
   reconstructionForm: $("#reconstruction-form"),
   closeReconstructionDialog: $("#close-reconstruction-dialog"),
@@ -156,6 +167,8 @@ const phaseLabels = {
   stopping: "正在封装",
   recorded: "等待重建",
   converting: "正在重建",
+  paused: "重建已暂停",
+  cancelling: "正在终止",
   completed: "重建完成",
   error: "需要处理",
 };
@@ -519,6 +532,7 @@ class LiveFrameBuffer {
     this.activeIndex = 0;
     this.hasFrame = false;
     this.loading = false;
+    this.loadingVersion = null;
     this.pending = null;
     this.currentVersion = null;
     this.loadToken = 0;
@@ -531,6 +545,7 @@ class LiveFrameBuffer {
     this.hasFrame = false;
     this.activeIndex = 0;
     this.loading = false;
+    this.loadingVersion = null;
     for (const image of [...this.rgbImages, ...this.depthImages]) {
       image.onload = null;
       image.onerror = null;
@@ -544,7 +559,13 @@ class LiveFrameBuffer {
   }
 
   request(rgbUrl, depthUrl, version) {
-    if (!rgbUrl || !depthUrl || version === this.currentVersion) return;
+    if (
+      !rgbUrl
+      || !depthUrl
+      || version === this.currentVersion
+      || version === this.loadingVersion
+      || version === this.pending?.version
+    ) return;
     this.pending = { rgbUrl, depthUrl, version };
     this.loadNext();
   }
@@ -572,6 +593,7 @@ class LiveFrameBuffer {
     const frame = this.pending;
     this.pending = null;
     this.loading = true;
+    this.loadingVersion = frame.version;
     const token = ++this.loadToken;
     const bufferIndex = this.hasFrame ? 1 - this.activeIndex : 0;
     const rgbImage = this.rgbImages[bufferIndex];
@@ -613,6 +635,7 @@ class LiveFrameBuffer {
     } finally {
       if (token !== this.loadToken) return;
       this.loading = false;
+      this.loadingVersion = null;
       if (this.pending) queueMicrotask(() => this.loadNext());
     }
   }
@@ -798,6 +821,23 @@ function closeReconstructionDialog() {
   }
 }
 
+function openStopConversionDialog() {
+  if (elements.stopConversion.disabled) return;
+  if (typeof elements.stopConversionDialog.showModal === "function") {
+    elements.stopConversionDialog.showModal();
+  } else {
+    elements.stopConversionDialog.setAttribute("open", "");
+  }
+}
+
+function closeStopConversionDialog() {
+  if (typeof elements.stopConversionDialog.close === "function") {
+    elements.stopConversionDialog.close();
+  } else {
+    elements.stopConversionDialog.removeAttribute("open");
+  }
+}
+
 async function fetchDevices(refresh = false) {
   if (app.deviceBusy) return;
   app.deviceBusy = true;
@@ -961,8 +1001,7 @@ function closeCameraParameters() {
 function updateJourney() {
   const phase = app.state ? app.state.phase : "idle";
   const hasSelection = Boolean(app.selectedHardware);
-  const recordReached = ["importing", "recording", "stopping", "recorded", "converting", "completed", "error"].includes(phase);
-  const convertReached = ["converting", "completed"].includes(phase);
+  const recordReached = ["importing", "recording", "stopping", "recorded", "converting", "paused", "cancelling", "completed", "error"].includes(phase);
   const items = {
     select: $("[data-journey='select']"),
     record: $("[data-journey='record']"),
@@ -980,7 +1019,7 @@ function updateJourney() {
     items.record.classList.add("done");
   }
   if (phase === "recorded" || phase === "error") items.convert.classList.add("active");
-  if (phase === "converting") items.convert.classList.add("active");
+  if (["converting", "paused", "cancelling"].includes(phase)) items.convert.classList.add("active");
   if (phase === "completed") items.convert.classList.add("done");
 }
 
@@ -1002,6 +1041,13 @@ function updateControls() {
   elements.manageRecordings.disabled = app.requestBusy;
   elements.openPointCloud.disabled = state.can_select_point_cloud === false || locked;
   elements.startConversion.disabled = !state.can_start_conversion || app.requestBusy;
+  const conversionTask = state.task === "convert" || ["converting", "paused", "cancelling"].includes(state.phase);
+  const paused = state.phase === "paused";
+  elements.conversionControls.hidden = !conversionTask;
+  elements.toggleConversion.classList.toggle("resume", paused);
+  elements.toggleConversionLabel.textContent = paused ? "继续重建" : "暂停重建";
+  elements.toggleConversion.disabled = app.requestBusy || !(paused ? state.can_resume_conversion : state.can_pause_conversion);
+  elements.stopConversion.disabled = app.requestBusy || !state.can_stop_conversion;
   elements.deviceIndex.disabled = !selected || locked;
   elements.recordingName.disabled = !selected || locked;
   elements.frameStride.disabled = !selected || locked;
@@ -1115,6 +1161,9 @@ function renderConversion(conversion) {
   if (!conversion) return;
   const stageIndex = Math.max(0, Math.min(5, Math.round(finiteNumber(conversion.stage_index))));
   const completed = conversion.status === "completed";
+  const paused = conversion.status === "paused";
+  const cancelling = conversion.status === "cancelling";
+  const failed = conversion.status === "failed";
   elements.pipelineSteps.forEach((item, index) => {
     item.classList.toggle("done", completed || index < stageIndex);
     item.classList.toggle("active", !completed && index === stageIndex);
@@ -1126,7 +1175,7 @@ function renderConversion(conversion) {
   const localProgress = measurable ? Math.max(0, Math.min(1, processed / total)) : 0;
   const percent = completed ? 100 : Math.min(99, ((stageIndex + localProgress) / 5) * 100);
   elements.pipelineProgressBar.style.width = `${percent}%`;
-  elements.pipelineProgressBar.classList.toggle("indeterminate", !completed && !measurable);
+  elements.pipelineProgressBar.classList.toggle("indeterminate", !completed && !paused && !cancelling && !measurable);
   elements.pipelineLabel.textContent = conversion.label || "正在重建";
   elements.pipelineDetail.textContent = conversion.detail || "等待进度信息";
   const fragmentTotal = Number(conversion.fragment_total);
@@ -1144,14 +1193,22 @@ function renderConversion(conversion) {
   const quietSeconds = Math.max(0, finiteNumber(conversion.quiet_seconds));
   const stageElapsed = Math.max(0, finiteNumber(conversion.stage_elapsed_seconds));
   const processAlive = Boolean(conversion.process_alive);
-  const quiet = processAlive && quietSeconds >= 8;
+  const quiet = processAlive && !paused && !cancelling && quietSeconds >= 8;
   elements.processActivity.classList.toggle("quiet", quiet);
   elements.processActivity.classList.toggle("failed", conversion.status === "failed");
+  elements.processActivity.classList.toggle("paused", paused);
+  elements.processActivity.classList.toggle("cancelling", cancelling);
   elements.processElapsed.textContent = `阶段 ${formatDuration(stageElapsed)}`;
   elements.processElapsed.title = `重建总用时 ${formatDuration(conversion.elapsed_seconds)}`;
   if (conversion.status === "failed") {
     elements.processActivityTitle.textContent = "重建进程已结束";
     elements.processActivityDetail.textContent = "请结合上方错误信息和下方日志排查";
+  } else if (paused) {
+    elements.processActivityTitle.textContent = "重建进程树已暂停";
+    elements.processActivityDetail.textContent = `当前阶段和全部统计已冻结 · 已暂停 ${Math.round(finiteNumber(conversion.paused_total_seconds))} 秒`;
+  } else if (cancelling) {
+    elements.processActivityTitle.textContent = "正在终止重建进程树";
+    elements.processActivityDetail.textContent = "原始录制保持不变，正在等待所有工作进程退出";
   } else if (quiet) {
     elements.processActivityTitle.textContent = conversion.stage === "make"
       ? "当前帧对仍在计算，后端进程保持运行"
@@ -1170,6 +1227,21 @@ function renderConversion(conversion) {
     elements.processActivityDetail.textContent = quietSeconds < 2
       ? "刚刚收到后端进度"
       : `${Math.round(quietSeconds)} 秒前收到最新日志`;
+  }
+
+  elements.backgroundTaskNote.classList.toggle("paused", paused);
+  if (paused) {
+    elements.backgroundTaskTitle.textContent = "后台任务已暂停并保留";
+    elements.backgroundTaskDetail.textContent = "可以安全关闭网页；请保持本地服务运行，回来后点击“继续重建”。";
+  } else if (cancelling) {
+    elements.backgroundTaskTitle.textContent = "正在放弃本次重建";
+    elements.backgroundTaskDetail.textContent = "仅结束计算进程；MKV/BAG 录制和已经落盘的文件不会被删除。";
+  } else if (failed) {
+    elements.backgroundTaskTitle.textContent = "后台任务已经结束";
+    elements.backgroundTaskDetail.textContent = "重建未完成，但 MKV/BAG 录制和已经落盘的文件仍然保留。";
+  } else {
+    elements.backgroundTaskTitle.textContent = "后台任务已托管";
+    elements.backgroundTaskDetail.textContent = "可以安全关闭网页；重新打开后会恢复当前进度、统计和日志。";
   }
 
   const artifacts = conversion.artifacts || {};
@@ -1239,7 +1311,8 @@ function renderConversion(conversion) {
 
 function renderProcess(state) {
   const captureActive = state.phase === "recording" || state.phase === "stopping";
-  const conversionActive = state.phase === "converting" || (state.phase === "error" && state.conversion);
+  const conversionPhases = ["converting", "paused", "cancelling"];
+  const conversionActive = conversionPhases.includes(state.phase) || (state.phase === "error" && state.conversion);
   elements.processPanel.hidden = !captureActive && !conversionActive;
   if (elements.processPanel.hidden) return;
 
@@ -1256,12 +1329,16 @@ function renderProcess(state) {
     elements.processTitle.textContent = synchronized ? "正在录制" : "正在连接并同步 RGB-D";
     renderLive(state.live);
   } else {
-    if (app.lastPhase !== "converting" && state.phase === "converting") {
+    if (!conversionPhases.includes(app.lastPhase) && conversionPhases.includes(state.phase)) {
       app.processRgbdKey = null;
       app.processModelKey = null;
     }
-    elements.processKicker.textContent = "RECONSTRUCTION";
-    elements.processTitle.textContent = "正在重建";
+    elements.processKicker.textContent = state.phase === "paused"
+      ? "PAUSED"
+      : (state.phase === "cancelling" ? "STOPPING" : "RECONSTRUCTION");
+    elements.processTitle.textContent = state.phase === "paused"
+      ? "重建已暂停"
+      : (state.phase === "cancelling" ? "正在终止重建" : "正在重建");
     renderConversion(state.conversion);
   }
 }
@@ -1270,6 +1347,8 @@ function renderEmptyStage(state) {
   const processActive = state.phase === "recording"
     || state.phase === "stopping"
     || state.phase === "converting"
+    || state.phase === "paused"
+    || state.phase === "cancelling"
     || (state.phase === "error" && state.conversion);
   const resultReady = Boolean(
     (state.mesh_url && state.mesh && state.mesh.exists)
@@ -1287,8 +1366,11 @@ function renderEmptyStage(state) {
     elements.emptyStageTitle.textContent = "正在导入已有录制";
     elements.emptyStageCopy.textContent = `${basename(progress.name)} · ${Math.round(finiteNumber(progress.percent))}% · ${formatBytes(progress.received_bytes)} / ${formatBytes(progress.total_bytes)}`;
   } else if (state.phase === "recorded") {
-    elements.emptyStageTitle.textContent = "录制文件已就绪";
-    elements.emptyStageCopy.textContent = "点击左侧“开始重建”，确认速度与质量参数后执行。";
+    const cancelled = state.conversion && state.conversion.status === "cancelled";
+    elements.emptyStageTitle.textContent = cancelled ? "本次重建已终止" : "录制文件已就绪";
+    elements.emptyStageCopy.textContent = cancelled
+      ? "原始录制仍在，可以调整参数后重新开始重建。"
+      : "点击左侧“开始重建”，确认速度与质量参数后执行。";
   } else if (state.phase === "error") {
     elements.emptyStageTitle.textContent = "任务未完成";
     elements.emptyStageCopy.textContent = state.error || "请查看下方日志后重试。";
@@ -1345,10 +1427,20 @@ function renderState(state) {
       setSummary("running", "正在安全结束录制", "正在等待相机后端封装文件，请不要拔出设备");
       break;
     case "recorded":
-      setSummary("success", "录制文件已就绪，可以开始重建", `${recordingPath} · ${formatBytes(state.recording && state.recording.size)}`);
+      if (state.conversion && state.conversion.status === "cancelled") {
+        setSummary("", "重建已终止，录制文件仍可使用", `${recordingPath} · ${formatBytes(state.recording && state.recording.size)}`);
+      } else {
+        setSummary("success", "录制文件已就绪，可以开始重建", `${recordingPath} · ${formatBytes(state.recording && state.recording.size)}`);
+      }
       break;
     case "converting":
       setSummary("running", "正在重建三维场景", (state.conversion && state.conversion.detail) || state.dataset || "正在准备数据集");
+      break;
+    case "paused":
+      setSummary("paused", "重建已暂停，进度完整保留", "可以关闭网页；保持本地服务运行后可随时继续");
+      break;
+    case "cancelling":
+      setSummary("failed", "正在终止重建", "正在清理计算进程，原始录制不会被删除");
       break;
     case "completed":
       setSummary("success", "重建已完成", state.mesh ? state.mesh.path : "integrated.ply");
@@ -1377,6 +1469,9 @@ function renderState(state) {
   renderProcess(state);
   renderResult(state);
   renderEmptyStage(state);
+  if (!state.can_stop_conversion && elements.stopConversionDialog.open) {
+    elements.stopConversionDialog.close();
+  }
   app.lastPhase = state.phase;
 }
 
@@ -1753,6 +1848,22 @@ elements.deleteRecordingOnly.addEventListener("click", () => deletePendingRecord
 elements.deleteRecordingAll.addEventListener("click", () => deletePendingRecording(true));
 
 elements.startConversion.addEventListener("click", openReconstructionDialog);
+elements.toggleConversion.addEventListener("click", () => {
+  const endpoint = app.state && app.state.phase === "paused"
+    ? "/api/convert/resume"
+    : "/api/convert/pause";
+  runAction(() => post(endpoint));
+});
+elements.stopConversion.addEventListener("click", openStopConversionDialog);
+elements.closeStopConversion.addEventListener("click", closeStopConversionDialog);
+elements.cancelStopConversion.addEventListener("click", closeStopConversionDialog);
+elements.stopConversionDialog.addEventListener("click", (event) => {
+  if (event.target === elements.stopConversionDialog) closeStopConversionDialog();
+});
+elements.confirmStopConversion.addEventListener("click", () => {
+  closeStopConversionDialog();
+  runAction(() => post("/api/convert/stop"));
+});
 
 for (const button of elements.reconstructionPresets) {
   button.addEventListener("click", () => {

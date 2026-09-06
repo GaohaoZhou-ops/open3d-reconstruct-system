@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
+import psutil
+
 from . import __version__
 from .configuration import read_json_object
 from .paths import (
@@ -774,6 +776,10 @@ class ControlCenter:
         self._conversion_finished_at: str | None = None
         self._conversion_progress: dict[str, Any] | None = None
         self._reconstruction_settings: dict[str, Any] | None = None
+        self._conversion_paused_at: str | None = None
+        self._conversion_paused_monotonic: float | None = None
+        self._suspended_processes: tuple[psutil.Process, ...] = ()
+        self._conversion_cancel_requested = False
         self._live_dir: Path | None = None
         self._device_cache: dict[str, Any] | None = None
         self._device_cache_at = 0.0
@@ -796,6 +802,9 @@ class ControlCenter:
             "detail": "正在打开录制文件并准备提取帧",
             "processed": 0,
             "total": None,
+            "pause_count": 0,
+            "paused_total_seconds": 0.0,
+            "paused_at": None,
             "settings": dict(self._reconstruction_settings or {}),
             "_started_monotonic": now,
             "_stage_started_monotonic": now,
@@ -810,6 +819,12 @@ class ControlCenter:
             "_matching_last": None,
             "_matching_expected": None,
         }
+
+    def _reset_conversion_control_locked(self) -> None:
+        self._conversion_paused_at = None
+        self._conversion_paused_monotonic = None
+        self._suspended_processes = ()
+        self._conversion_cancel_requested = False
 
     @staticmethod
     def _expected_matching_pairs(
@@ -1543,6 +1558,7 @@ class ControlCenter:
         self._conversion_finished_at = None
         self._conversion_progress = None
         self._reconstruction_settings = None
+        self._reset_conversion_control_locked()
         self._import_temp = None
         self._import_target = None
         self._import_expected_bytes = 0
@@ -1930,6 +1946,34 @@ class ControlCenter:
 
     def _finish_conversion_locked(self, returncode: int) -> None:
         self._conversion_finished_at = _now_iso()
+        cancelled = self._conversion_cancel_requested
+        self._reset_conversion_control_locked()
+        if cancelled:
+            recording_preserved = _is_nonempty_file(self._recording)
+            self._phase = "recorded" if recording_preserved else "error"
+            self._error = (
+                None
+                if recording_preserved
+                else "重建已终止，但原始录制文件当前不可访问"
+            )
+            if self._conversion_progress is not None:
+                self._conversion_progress.update(
+                    label="重建已终止",
+                    status="cancelled",
+                    paused_at=None,
+                    detail=(
+                        "重建任务已由用户终止；原始录制文件已保留，可以重新开始"
+                        if recording_preserved
+                        else self._error
+                    ),
+                )
+                self._conversion_progress.pop("_detail_before_pause", None)
+            self._append_log(
+                "重建任务已终止，原始录制文件已保留。",
+                level="command",
+            )
+            return
+
         mesh = self._mesh
         valid = _is_nonempty_file(mesh)
         if returncode == 0 and valid:
@@ -1989,6 +2033,7 @@ class ControlCenter:
             self._conversion_finished_at = None
             self._conversion_progress = None
             self._reconstruction_settings = None
+            self._reset_conversion_control_locked()
             live_dir = self._prepare_live_dir_locked()
             self._touch_locked()
             command = [
@@ -2036,7 +2081,7 @@ class ControlCenter:
         except ProcessLookupError:
             return
         except (OSError, PermissionError) as exc:
-            raise WebActionError(f"无法停止录制进程: {exc}") from exc
+            raise WebActionError(f"无法控制任务进程: {exc}") from exc
 
     def _request_recording_stop_locked(self) -> None:
         if self._live_dir is not None:
@@ -2078,6 +2123,271 @@ class ControlCenter:
                 return
         self._append_log("正常停止等待超时，正在终止卡住的采集进程。", level="error")
         self._signal_process_group(process, signal.SIGTERM)
+
+    @staticmethod
+    def _suspend_conversion_process_tree(
+        process: subprocess.Popen[str],
+    ) -> tuple[psutil.Process, ...]:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGSTOP)
+            except ProcessLookupError as exc:
+                raise WebActionError("重建进程已经结束，无法暂停") from exc
+            except (OSError, PermissionError) as exc:
+                raise WebActionError(f"无法暂停重建进程组: {exc}") from exc
+            return ()
+
+        try:
+            root = psutil.Process(process.pid)
+            candidates = [root, *root.children(recursive=True)]
+        except psutil.NoSuchProcess as exc:
+            raise WebActionError("重建进程已经结束，无法暂停") from exc
+        except (psutil.AccessDenied, psutil.Error) as exc:
+            raise WebActionError(f"无法枚举 Windows 重建进程树: {exc}") from exc
+
+        suspended: list[psutil.Process] = []
+        seen: set[int] = set()
+
+        def suspend_one(candidate: psutil.Process) -> None:
+            if candidate.pid in seen:
+                return
+            try:
+                candidate.suspend()
+            except psutil.NoSuchProcess:
+                return
+            seen.add(candidate.pid)
+            suspended.append(candidate)
+
+        try:
+            for candidate in candidates:
+                suspend_one(candidate)
+            # The root is suspended first. Re-scan to catch a child that was
+            # created between the initial process snapshot and that suspend.
+            for _attempt in range(3):
+                additions = [
+                    candidate
+                    for candidate in root.children(recursive=True)
+                    if candidate.pid not in seen
+                ]
+                if not additions:
+                    break
+                for candidate in additions:
+                    suspend_one(candidate)
+        except (psutil.AccessDenied, psutil.Error) as exc:
+            for candidate in reversed(suspended):
+                try:
+                    candidate.resume()
+                except psutil.Error:
+                    pass
+            raise WebActionError(f"无法暂停完整的 Windows 重建进程树: {exc}") from exc
+
+        if not suspended:
+            raise WebActionError("重建进程已经结束，无法暂停")
+        return tuple(suspended)
+
+    @staticmethod
+    def _resume_conversion_process_tree(
+        process: subprocess.Popen[str],
+        suspended: tuple[psutil.Process, ...],
+    ) -> None:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGCONT)
+            except ProcessLookupError as exc:
+                raise WebActionError("重建进程已经结束，无法继续") from exc
+            except (OSError, PermissionError) as exc:
+                raise WebActionError(f"无法继续重建进程组: {exc}") from exc
+            return
+
+        failures: list[str] = []
+        for candidate in reversed(suspended):
+            try:
+                candidate.resume()
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, psutil.Error) as exc:
+                failures.append(f"PID {candidate.pid}: {exc}")
+        if failures:
+            raise WebActionError(
+                "无法继续完整的 Windows 重建进程树: " + "; ".join(failures)
+            )
+
+    @staticmethod
+    def _terminate_conversion_process_tree(
+        process: subprocess.Popen[str], *, force: bool = False
+    ) -> None:
+        if os.name != "nt":
+            ControlCenter._signal_process_group(
+                process,
+                signal.SIGKILL if force else signal.SIGTERM,
+            )
+            return
+
+        try:
+            root = psutil.Process(process.pid)
+            targets = [*reversed(root.children(recursive=True)), root]
+        except psutil.NoSuchProcess:
+            return
+        except (psutil.AccessDenied, psutil.Error) as exc:
+            raise WebActionError(f"无法枚举 Windows 重建进程树: {exc}") from exc
+
+        failures: list[str] = []
+        for candidate in targets:
+            try:
+                candidate.kill() if force else candidate.terminate()
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, psutil.Error) as exc:
+                failures.append(f"PID {candidate.pid}: {exc}")
+        if failures:
+            raise WebActionError(
+                "无法终止完整的 Windows 重建进程树: " + "; ".join(failures)
+            )
+
+    def pause_conversion(self) -> dict[str, Any]:
+        with self._lock:
+            process = self._process
+            if process is None or self._task != "convert":
+                raise WebActionError("当前没有正在重建的任务")
+            if self._phase == "paused":
+                return self._snapshot_locked()
+            if self._phase != "converting":
+                raise WebActionError("当前重建任务不能暂停")
+
+            suspended = self._suspend_conversion_process_tree(process)
+            paused_monotonic = time.monotonic()
+            paused_at = _now_iso()
+            self._suspended_processes = suspended
+            self._conversion_paused_monotonic = paused_monotonic
+            self._conversion_paused_at = paused_at
+            self._phase = "paused"
+            if self._conversion_progress is not None:
+                progress = self._conversion_progress
+                detail = str(progress.get("detail") or "等待继续重建")
+                progress["_detail_before_pause"] = detail
+                progress.update(
+                    status="paused",
+                    paused_at=paused_at,
+                    pause_count=int(progress.get("pause_count") or 0) + 1,
+                    detail=f"任务已暂停；继续后将从当前位置运行。暂停前：{detail}",
+                )
+            self._append_log(
+                "重建任务已暂停；后台进程与当前进度均已保留。",
+                level="command",
+            )
+            self._touch_locked()
+            return self._snapshot_locked()
+
+    def _resume_conversion_locked(self, *, announce: bool) -> None:
+        process = self._process
+        if process is None or self._task != "convert" or self._phase != "paused":
+            raise WebActionError("当前没有已暂停的重建任务")
+        paused_monotonic = self._conversion_paused_monotonic
+        if paused_monotonic is None:
+            raise WebActionError("重建暂停状态不完整，无法安全继续")
+
+        self._resume_conversion_process_tree(process, self._suspended_processes)
+        resumed_monotonic = time.monotonic()
+        paused_seconds = max(0.0, resumed_monotonic - paused_monotonic)
+        progress = self._conversion_progress
+        if progress is not None:
+            for key in (
+                "_started_monotonic",
+                "_stage_started_monotonic",
+                "_last_output_monotonic",
+            ):
+                value = progress.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    progress[key] = float(value) + paused_seconds
+            detail = progress.pop("_detail_before_pause", None)
+            progress.update(
+                status="running",
+                paused_at=None,
+                paused_total_seconds=(
+                    float(progress.get("paused_total_seconds") or 0.0)
+                    + paused_seconds
+                ),
+                detail=detail or "重建任务已继续，正在等待新的进度信息",
+            )
+        self._phase = "converting"
+        self._conversion_paused_at = None
+        self._conversion_paused_monotonic = None
+        self._suspended_processes = ()
+        if announce:
+            self._append_log(
+                f"重建任务已继续；本次暂停 {paused_seconds:.1f} 秒。",
+                level="command",
+            )
+        self._touch_locked()
+
+    def resume_conversion(self) -> dict[str, Any]:
+        with self._lock:
+            if self._task == "convert" and self._phase == "converting":
+                return self._snapshot_locked()
+            self._resume_conversion_locked(announce=True)
+            return self._snapshot_locked()
+
+    def stop_conversion(self) -> dict[str, Any]:
+        with self._lock:
+            process = self._process
+            if process is None or self._task != "convert":
+                raise WebActionError("当前没有正在重建的任务")
+            if self._conversion_cancel_requested or self._phase == "cancelling":
+                return self._snapshot_locked()
+
+            force = False
+            if self._phase == "paused":
+                try:
+                    self._resume_conversion_locked(announce=False)
+                except WebActionError as exc:
+                    force = True
+                    self._append_log(
+                        f"无法先恢复已暂停进程，将强制终止：{exc}",
+                        level="error",
+                    )
+                    self._conversion_paused_at = None
+                    self._conversion_paused_monotonic = None
+                    self._suspended_processes = ()
+
+            self._conversion_cancel_requested = True
+            self._phase = "cancelling"
+            if self._conversion_progress is not None:
+                self._conversion_progress.update(
+                    status="cancelling",
+                    paused_at=None,
+                    detail="正在终止重建进程；原始 MKV/BAG 录制不会被删除",
+                )
+            self._append_log(
+                "正在终止重建任务；录制文件将完整保留。",
+                level="command",
+            )
+            self._terminate_conversion_process_tree(process, force=force)
+            generation = self._generation
+            threading.Thread(
+                target=self._conversion_stop_watchdog,
+                args=(process, generation),
+                name="web-convert-stop-watchdog",
+                daemon=True,
+            ).start()
+            self._touch_locked()
+            return self._snapshot_locked()
+
+    def _conversion_stop_watchdog(
+        self, process: subprocess.Popen[str], generation: int
+    ) -> None:
+        deadline = time.monotonic() + 8.0
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if process.poll() is not None:
+            return
+        with self._lock:
+            if self._process is not process or self._generation != generation:
+                return
+        self._append_log(
+            "重建进程未及时退出，正在强制清理整个进程树。",
+            level="error",
+        )
+        self._terminate_conversion_process_tree(process, force=True)
 
     def start_conversion(
         self,
@@ -2124,6 +2434,7 @@ class ControlCenter:
                 "stride": stride_value,
                 **parameter_values,
             }
+            self._reset_conversion_control_locked()
             self._reset_conversion_progress_locked()
             self._append_log(
                 "开始提取 RGB-D 帧并执行 make、register、refine、integrate 四阶段重建。",
@@ -2267,18 +2578,28 @@ class ControlCenter:
             return None
         progress = dict(self._conversion_progress)
         stage = progress.get("stage")
-        now = time.monotonic()
+        clock_now = time.monotonic()
+        now = self._conversion_paused_monotonic or clock_now
         started = float(progress.pop("_started_monotonic", now))
         stage_started = float(progress.pop("_stage_started_monotonic", started))
         last_output = float(progress.pop("_last_output_monotonic", started))
+        progress.pop("_detail_before_pause", None)
         elapsed = max(0.0, now - started)
         stage_elapsed = max(0.0, now - stage_started)
         quiet = max(0.0, now - last_output)
+        paused_total = float(progress.get("paused_total_seconds") or 0.0)
+        if self._conversion_paused_monotonic is not None:
+            paused_total += max(
+                0.0, clock_now - self._conversion_paused_monotonic
+            )
         progress.update(
             elapsed_seconds=elapsed,
             stage_elapsed_seconds=stage_elapsed,
             quiet_seconds=quiet,
+            paused_total_seconds=paused_total,
             process_alive=self._process is not None and self._process.poll() is None,
+            paused=self._phase == "paused",
+            paused_at=self._conversion_paused_at,
             heartbeat_at=_now_iso(),
         )
 
@@ -2412,12 +2733,16 @@ class ControlCenter:
             "recording_finished_at": self._recording_finished_at,
             "conversion_started_at": self._conversion_started_at,
             "conversion_finished_at": self._conversion_finished_at,
+            "conversion_paused_at": self._conversion_paused_at,
             "reconstruction_settings": self._reconstruction_settings,
             "recording_import": import_progress,
             "can_start_recording": not busy,
             "can_import_recording": not busy,
             "can_stop_recording": process is not None and self._task == "record" and self._phase == "recording",
             "can_start_conversion": not busy and recording_ready,
+            "can_pause_conversion": process is not None and self._task == "convert" and self._phase == "converting",
+            "can_resume_conversion": process is not None and self._task == "convert" and self._phase == "paused",
+            "can_stop_conversion": process is not None and self._task == "convert" and self._phase in {"converting", "paused"},
             "can_select_point_cloud": not busy,
             "recording_url": "/api/files/recording" if recording_ready else None,
             "mesh_url": "/api/files/mesh" if mesh_ready else None,
@@ -2686,23 +3011,45 @@ class ControlCenter:
             if process is None or process.poll() is not None:
                 return
             self._append_log("Web 服务正在退出，先停止当前子任务。", level="command")
+            force_conversion_stop = False
             with self._lock:
                 recording = self._task == "record"
+                converting = self._task == "convert"
                 if recording:
                     self._request_recording_stop_locked()
-            if not recording:
+                elif converting:
+                    self._conversion_cancel_requested = True
+                    if self._phase == "paused":
+                        try:
+                            self._resume_conversion_locked(announce=False)
+                        except WebActionError:
+                            force_conversion_stop = True
+                            self._conversion_paused_at = None
+                            self._conversion_paused_monotonic = None
+                            self._suspended_processes = ()
+            if converting:
+                self._terminate_conversion_process_tree(
+                    process, force=force_conversion_stop
+                )
+            elif not recording:
                 self._signal_process_group(process, signal.SIGINT)
             try:
                 process.wait(timeout=12)
                 return
             except subprocess.TimeoutExpired:
                 pass
-            self._signal_process_group(process, signal.SIGTERM)
+            if converting:
+                self._terminate_conversion_process_tree(process, force=True)
+            else:
+                self._signal_process_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=3)
                 return
             except subprocess.TimeoutExpired:
-                self._signal_process_group(process, signal.SIGKILL)
+                if converting:
+                    self._terminate_conversion_process_tree(process, force=True)
+                else:
+                    self._signal_process_group(process, signal.SIGKILL)
         finally:
             with self._lock:
                 self._discard_live_dir_locked()
@@ -3126,6 +3473,12 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                         stride=body.get("stride", 1),
                         parameters=body.get("parameters"),
                     )
+                elif parsed.path == "/api/convert/pause":
+                    state = controller.pause_conversion()
+                elif parsed.path == "/api/convert/resume":
+                    state = controller.resume_conversion()
+                elif parsed.path == "/api/convert/stop":
+                    state = controller.stop_conversion()
                 else:
                     self._error(HTTPStatus.NOT_FOUND, "接口不存在")
                     return
