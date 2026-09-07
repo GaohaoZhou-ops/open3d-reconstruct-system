@@ -201,55 +201,12 @@ const app = {
   pendingRecordingDelete: null,
 };
 
-const reconstructionPresets = {
-  fast: {
-    label: "速度优先",
-    stride: "4",
-    voxel: "0.08",
-    depthMin: "0.3",
-    depthMax: "3",
-    global: "fgr",
-    fragmentSize: "60",
-    keyframeInterval: "10",
-    icp: "point_to_plane",
-    depthDiff: "0.07",
-    tsdfCubicSize: "5.12",
-    sdfTrunc: "0.05",
-    loopOdometry: "0.1",
-    loopRegistration: "5",
-  },
-  balanced: {
-    label: "均衡",
-    stride: "2",
-    voxel: "0.05",
-    depthMin: "0.3",
-    depthMax: "3",
-    global: "ransac",
-    fragmentSize: "100",
-    keyframeInterval: "5",
-    icp: "color",
-    depthDiff: "0.07",
-    tsdfCubicSize: "3",
-    sdfTrunc: "0.04",
-    loopOdometry: "0.1",
-    loopRegistration: "5",
-  },
-  quality: {
-    label: "质量优先",
-    stride: "1",
-    voxel: "0.03",
-    depthMin: "0.3",
-    depthMax: "3",
-    global: "ransac",
-    fragmentSize: "100",
-    keyframeInterval: "3",
-    icp: "color",
-    depthDiff: "0.05",
-    tsdfCubicSize: "2.048",
-    sdfTrunc: "0.02",
-    loopOdometry: "0.1",
-    loopRegistration: "5",
-  },
+let reconstructionPresets = {};
+let defaultReconstructionPreset = "medium";
+const reconstructionPresetClasses = {
+  low: "fast",
+  medium: "balanced",
+  high: "quality",
 };
 
 function formatBytes(bytes) {
@@ -738,6 +695,51 @@ function reconstructionFormValues() {
   };
 }
 
+function reconstructionProfileValues(profile) {
+  const parameters = profile.parameters || {};
+  return {
+    label: profile.label || "自定义",
+    description: profile.description || "",
+    stride: String(profile.stride),
+    voxel: String(parameters.voxel_size),
+    depthMin: String(parameters.depth_min),
+    depthMax: String(parameters.depth_max),
+    global: String(parameters.global_registration),
+    fragmentSize: String(parameters.n_frames_per_fragment),
+    keyframeInterval: String(parameters.n_keyframes_per_n_frame),
+    icp: String(parameters.icp_method),
+    depthDiff: String(parameters.depth_diff_max),
+    tsdfCubicSize: String(parameters.tsdf_cubic_size),
+    sdfTrunc: String(parameters.sdf_trunc),
+    loopOdometry: String(parameters.preference_loop_closure_odometry),
+    loopRegistration: String(parameters.preference_loop_closure_registration),
+  };
+}
+
+async function loadReconstructionConfiguration() {
+  const payload = await api("/api/reconstruction/config");
+  const configuration = payload.configuration || {};
+  reconstructionPresets = Object.fromEntries(
+    Object.entries(configuration.profiles || {}).map(([name, profile]) => (
+      [name, reconstructionProfileValues(profile)]
+    )),
+  );
+  defaultReconstructionPreset = configuration.default_profile || "medium";
+  for (const button of elements.reconstructionPresets) {
+    const preset = reconstructionPresets[button.dataset.reconstructionPreset];
+    if (!preset) {
+      button.hidden = true;
+      continue;
+    }
+    button.hidden = false;
+    const title = button.querySelector("strong");
+    const detail = button.querySelector("small");
+    if (title) title.textContent = preset.label;
+    if (detail) detail.textContent = preset.description;
+  }
+  applyReconstructionPreset(defaultReconstructionPreset);
+}
+
 function matchingReconstructionPreset(values) {
   return Object.entries(reconstructionPresets).find(([, preset]) => (
     Object.keys(values).every((key) => values[key] === preset[key])
@@ -750,7 +752,7 @@ function updateReconstructionSummary() {
   for (const button of elements.reconstructionPresets) {
     button.classList.toggle("selected", button.dataset.reconstructionPreset === presetName);
   }
-  const indicatorClass = presetName || "balanced";
+  const indicatorClass = reconstructionPresetClasses[presetName] || "balanced";
   const indicatorLabel = presetName ? reconstructionPresets[presetName].label : "自定义";
   elements.qualityIndicator.className = `quality-indicator ${indicatorClass}`;
   elements.qualityIndicator.textContent = indicatorLabel;
@@ -3342,6 +3344,10 @@ window.addEventListener("visibilitychange", () => {
   }
 });
 
+loadReconstructionConfiguration().catch((error) => {
+  elements.errorBanner.hidden = false;
+  elements.errorBanner.textContent = `无法读取重建 YAML：${error.message}`;
+});
 fetchDevices(false);
 pollState();
 setInterval(pollState, 1000);

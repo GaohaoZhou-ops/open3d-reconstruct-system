@@ -59,6 +59,15 @@ def existing_extraction_matches(
         or frames <= 0
     ):
         return False
+    if (
+        source.suffix.lower() == ".mkv"
+        and manifest.get("camera") == "azure-kinect"
+        and manifest.get("alignment")
+        not in {"depth-to-color", "color-to-undistorted-depth"}
+    ):
+        # Older native extractions could be marked complete even when K4A's
+        # headless transform engine returned raw, differently-sized images.
+        return False
     return (
         (destination / "intrinsic.json").is_file()
         and len(_color_frames(destination)) == frames

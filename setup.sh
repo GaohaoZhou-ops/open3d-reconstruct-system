@@ -150,6 +150,10 @@ export UV_TOOL_DIR="$PROJECT_ROOT/.tools/uv-tools"
 export UV_TOOL_BIN_DIR="$PROJECT_ROOT/.tools/uv-tool-bin"
 export UV_PYTHON_PREFERENCE=only-managed
 export UV_PYTHON_INSTALL_BIN=0
+# Cloud images and CI runners sometimes inject a global UV_PROJECT_ENVIRONMENT
+# (for example `/.venv`).  Pin it explicitly so the isolation guarantee remains
+# true on those hosts as well as on ordinary desktop shells.
+export UV_PROJECT_ENVIRONMENT="$PROJECT_ROOT/.venv"
 export PYTHONNOUSERSITE=1
 
 # A copied worktree may already contain a venv bound to another machine or to
@@ -180,7 +184,8 @@ else
     run_online_uv "$UV_BIN" sync --project "$PROJECT_ROOT" --frozen
 fi
 
-chmod +x "$PROJECT_ROOT/open3d-reconstruct" "$PROJECT_ROOT/setup.sh"
+chmod +x "$PROJECT_ROOT/open3d-reconstruct" "$PROJECT_ROOT/setup.sh" \
+    "$PROJECT_ROOT/cloud-reconstruct.sh"
 
 echo
 echo "安装完成（${PLATFORM}）：Python、虚拟环境和 Python 包均位于："

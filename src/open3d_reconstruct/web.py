@@ -24,11 +24,17 @@ from urllib.parse import parse_qs, quote, urlsplit
 import psutil
 
 from . import __version__
-from .configuration import read_json_object
+from .compute import resolve_compute_backend
+from .configuration import (
+    normalize_reconstruction_parameters,
+    read_json_object,
+    reconstruction_profile_catalog,
+)
 from .paths import (
     DATASETS_DIR,
     DEFAULT_AZURE_SENSOR_CONFIG,
     DEFAULT_REALSENSE_SENSOR_CONFIG,
+    DEFAULT_RECONSTRUCTION_PROFILES,
     IS_WSL,
     RECORDINGS_DIR,
     ROOT,
@@ -217,41 +223,6 @@ CAMERA_PARAMETER_DISPLAY_VALUES: dict[tuple[str, str], dict[str, str]] = {
         "RS2_RS400_VISUAL_PRESET_MEDIUM_DENSITY": "Medium Density（中密度）",
     },
 }
-
-RECONSTRUCTION_PARAMETER_RULES: dict[str, dict[str, Any]] = {
-    "n_frames_per_fragment": {
-        "kind": "integer",
-        "minimum": 30,
-        "maximum": 300,
-    },
-    "n_keyframes_per_n_frame": {
-        "kind": "integer",
-        "minimum": 2,
-        "maximum": 30,
-    },
-    "depth_min": {"kind": "number", "minimum": 0.0, "maximum": 5.0},
-    "depth_max": {"kind": "number", "minimum": 0.5, "maximum": 10.0},
-    "voxel_size": {"kind": "number", "minimum": 0.01, "maximum": 0.2},
-    "depth_diff_max": {"kind": "number", "minimum": 0.01, "maximum": 0.3},
-    "tsdf_cubic_size": {"kind": "number", "minimum": 0.512, "maximum": 10.24},
-    "sdf_trunc": {"kind": "number", "minimum": 0.005, "maximum": 0.2},
-    "preference_loop_closure_odometry": {
-        "kind": "number",
-        "minimum": 0.01,
-        "maximum": 20.0,
-    },
-    "preference_loop_closure_registration": {
-        "kind": "number",
-        "minimum": 0.01,
-        "maximum": 20.0,
-    },
-    "icp_method": {
-        "kind": "choice",
-        "choices": {"point_to_point", "point_to_plane", "color", "generalized"},
-    },
-    "global_registration": {"kind": "choice", "choices": {"fgr", "ransac"}},
-}
-
 
 class WebActionError(RuntimeError):
     def __init__(self, message: str, status: int = HTTPStatus.CONFLICT) -> None:
@@ -632,6 +603,15 @@ def _camera_configuration(hardware_id: str) -> dict[str, Any]:
     }
 
 
+def _reconstruction_configuration() -> dict[str, Any]:
+    catalog = reconstruction_profile_catalog(DEFAULT_RECONSTRUCTION_PROFILES)
+    catalog["source"] = _display_path(DEFAULT_RECONSTRUCTION_PROFILES)
+    catalog["compute"] = resolve_compute_backend(
+        catalog["compute_backend"]
+    ).to_dict()
+    return catalog
+
+
 def _file_summary(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None
@@ -731,79 +711,10 @@ def _recording_import_spec(
 
 
 def _validated_reconstruction_parameters(value: object) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise WebActionError("重建参数必须是 JSON 对象", HTTPStatus.BAD_REQUEST)
-    unknown = sorted(set(value) - set(RECONSTRUCTION_PARAMETER_RULES))
-    if unknown:
-        raise WebActionError(
-            f"不支持的重建参数: {', '.join(unknown)}",
-            HTTPStatus.BAD_REQUEST,
-        )
-
-    result: dict[str, Any] = {}
-    for key, rule in RECONSTRUCTION_PARAMETER_RULES.items():
-        if key not in value:
-            continue
-        raw = value[key]
-        kind = rule["kind"]
-        if kind == "integer":
-            if not isinstance(raw, int) or isinstance(raw, bool):
-                raise WebActionError(f"重建参数 {key} 必须是整数", HTTPStatus.BAD_REQUEST)
-            parsed: Any = raw
-        elif kind == "number":
-            if not isinstance(raw, (int, float)) or isinstance(raw, bool):
-                raise WebActionError(f"重建参数 {key} 必须是数值", HTTPStatus.BAD_REQUEST)
-            parsed = float(raw)
-            if not math.isfinite(parsed):
-                raise WebActionError(
-                    f"重建参数 {key} 必须是有限数值",
-                    HTTPStatus.BAD_REQUEST,
-                )
-        else:
-            if not isinstance(raw, str) or raw not in rule["choices"]:
-                choices = ", ".join(sorted(rule["choices"]))
-                raise WebActionError(
-                    f"重建参数 {key} 必须是以下值之一: {choices}",
-                    HTTPStatus.BAD_REQUEST,
-                )
-            result[key] = raw
-            continue
-
-        if parsed < rule["minimum"] or parsed > rule["maximum"]:
-            raise WebActionError(
-                f"重建参数 {key} 必须在 {rule['minimum']} 到 {rule['maximum']} 之间",
-                HTTPStatus.BAD_REQUEST,
-            )
-        result[key] = parsed
-
-    frames = result.get("n_frames_per_fragment")
-    keyframe_interval = result.get("n_keyframes_per_n_frame")
-    if frames is not None and keyframe_interval is not None and keyframe_interval > frames:
-        raise WebActionError(
-            "关键帧间隔不能大于每个局部片段的帧数",
-            HTTPStatus.BAD_REQUEST,
-        )
-    depth_min = result.get("depth_min")
-    depth_max = result.get("depth_max")
-    if depth_min is not None and depth_max is not None and depth_min >= depth_max:
-        raise WebActionError(
-            "最小深度必须小于最大深度",
-            HTTPStatus.BAD_REQUEST,
-        )
-    tsdf_cubic_size = result.get("tsdf_cubic_size")
-    sdf_trunc = result.get("sdf_trunc")
-    if (
-        tsdf_cubic_size is not None
-        and sdf_trunc is not None
-        and sdf_trunc < tsdf_cubic_size / 512.0
-    ):
-        raise WebActionError(
-            "SDF 截断距离不能小于 TSDF 融合体素边长",
-            HTTPStatus.BAD_REQUEST,
-        )
-    return result
+    try:
+        return normalize_reconstruction_parameters(value)
+    except ValueError as exc:
+        raise WebActionError(str(exc), HTTPStatus.BAD_REQUEST) from exc
 
 
 class ControlCenter:
@@ -3659,6 +3570,16 @@ def _handler_class(controller: ControlCenter, instance_id: str | None = None):
                 self._send_json(
                     {"ok": True, "recordings": controller.recordings_snapshot()}
                 )
+            elif parsed.path == "/api/reconstruction/config":
+                try:
+                    configuration = _reconstruction_configuration()
+                except ValueError as exc:
+                    self._error(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        f"重建 YAML 无效: {exc}",
+                    )
+                    return
+                self._send_json({"ok": True, "configuration": configuration})
             elif parsed.path == "/api/live/state":
                 self._send_json({"ok": True, "live": controller.live_snapshot()})
             elif parsed.path in {"/api/live/rgb", "/api/live/depth"}:
@@ -3824,6 +3745,10 @@ def serve_web(*, port: int = DEFAULT_WEB_PORT, open_browser: bool = True) -> int
     if not 1 <= port <= 65535:
         raise ValueError("端口必须在 1 到 65535 之间")
     ensure_local_directories()
+    # Fail before daemonizing if a user edit made the shared Web/YAML presets
+    # invalid.  This validation does not probe Torch and therefore does not add
+    # GPU import latency to the service health-check window.
+    reconstruction_profile_catalog(DEFAULT_RECONSTRUCTION_PROFILES)
     with SingletonLease(port=port) as lease:
         assert lease.metadata is not None
         controller = ControlCenter()

@@ -1,0 +1,70 @@
+# Open3D RGB-D 重建配置（Windows / Linux / macOS 共用）
+#
+# Web 页面中的“低 / 中 / 高”三档预设和云端交互脚本都读取本文件。
+# 命令行可直接选择档位：
+#   ./open3d-reconstruct reconstruct <MKV|BAG|数据集> \
+#     --reconstruction-config config/reconstruction.yaml --profile medium
+
+version: 1
+default_profile: medium
+
+# auto: Linux/WSL 优先 CUDA，Apple Silicon 优先 MPS，不可用时自动回退 CPU。
+compute_backend: auto
+# 此设备仅供可选的 Open3D SLAC 阶段使用；经典四阶段默认使用 CPU:0。
+compute_device: CPU:0
+stages: [make, register, refine, integrate]
+
+profiles:
+  low:
+    label: 低质量（速度优先）
+    description: 每 4 帧取 1 帧，适合快速预览和流程验证。
+    stride: 4
+    parameters:
+      voxel_size: 0.08
+      depth_min: 0.3
+      depth_max: 3.0
+      global_registration: fgr
+      n_frames_per_fragment: 60
+      n_keyframes_per_n_frame: 10
+      icp_method: point_to_plane
+      depth_diff_max: 0.07
+      tsdf_cubic_size: 5.12
+      sdf_trunc: 0.05
+      preference_loop_closure_odometry: 0.1
+      preference_loop_closure_registration: 5.0
+
+  medium:
+    label: 中质量（均衡）
+    description: 每 2 帧取 1 帧，兼顾细节、稳定性与耗时。
+    stride: 2
+    parameters:
+      voxel_size: 0.05
+      depth_min: 0.3
+      depth_max: 3.0
+      global_registration: ransac
+      n_frames_per_fragment: 100
+      n_keyframes_per_n_frame: 5
+      icp_method: color
+      depth_diff_max: 0.07
+      tsdf_cubic_size: 3.0
+      sdf_trunc: 0.04
+      preference_loop_closure_odometry: 0.1
+      preference_loop_closure_registration: 5.0
+
+  high:
+    label: 高质量（质量优先）
+    description: 保留每一帧并使用更精细的配准与融合参数。
+    stride: 1
+    parameters:
+      voxel_size: 0.03
+      depth_min: 0.3
+      depth_max: 3.0
+      global_registration: ransac
+      n_frames_per_fragment: 100
+      n_keyframes_per_n_frame: 3
+      icp_method: color
+      depth_diff_max: 0.05
+      tsdf_cubic_size: 2.048
+      sdf_trunc: 0.02
+      preference_loop_closure_odometry: 0.1
+      preference_loop_closure_registration: 5.0

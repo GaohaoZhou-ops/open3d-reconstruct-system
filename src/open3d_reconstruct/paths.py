@@ -18,6 +18,7 @@ DEFAULT_REALSENSE_SENSOR_CONFIG = ROOT / "config" / "realsense-d435.json"
 # Backwards-compatible name used by the Azure Kinect backend.
 DEFAULT_SENSOR_CONFIG = DEFAULT_AZURE_SENSOR_CONFIG
 DEFAULT_RECONSTRUCTION_CONFIG = ROOT / "config" / "reconstruction.json"
+DEFAULT_RECONSTRUCTION_PROFILES = ROOT / "config" / "reconstruction.yaml"
 AZURE_UDEV_RULE = ROOT / "config" / "99-k4a.rules"
 REALSENSE_UDEV_RULE = ROOT / "config" / "99-realsense-libusb.rules"
 # Backwards-compatible name used by older callers.

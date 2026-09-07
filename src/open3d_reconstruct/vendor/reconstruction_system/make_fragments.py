@@ -272,8 +272,9 @@ def run(config):
         bool(config.get("compute_accelerated"))
         and config.get("compute_backend_resolved") in {"cuda", "mps"}
     )
+    cpu_count = multiprocessing.cpu_count()
     if config["python_multi_threading"] is True:
-        worker_limit = max(1, multiprocessing.cpu_count() - 1)
+        worker_limit = max(1, cpu_count - 1)
         if config.get("compute_backend_resolved") == "mps":
             # Two Metal contexts overlap CPU loop-closure and TSDF work while
             # keeping unified-memory pressure bounded on base M-series chips.
@@ -294,16 +295,40 @@ def run(config):
 
     args = [(fragment_id, color_files, depth_files, n_files,
              n_fragments, config) for fragment_id in range(n_fragments)]
-    if config["python_multi_threading"] is True and max_workers > 1:
+    # On many-core cloud hosts, running one fragment in the parent lets native
+    # libraries create a thread for every visible vCPU.  For these small RGB-D
+    # kernels that severe oversubscription is much slower than one isolated,
+    # bounded worker.  Desktop-size machines retain the original direct path.
+    isolate_many_core_cpu = (
+        config["python_multi_threading"] is True
+        and max_workers == 1
+        and not gpu_active
+        and cpu_count >= 32
+    )
+    use_worker_pool = (
+        config["python_multi_threading"] is True
+        and (max_workers > 1 or isolate_many_core_cpu)
+    )
+    if isolate_many_core_cpu:
+        print("检测到 %d 个 CPU 线程；单片段使用 1 个受控子进程，避免线程过度订阅。" %
+              cpu_count, flush=True)
+    if use_worker_pool:
         # Prevent over allocation of open mp threads in child processes
+        previous_omp_threads = os.environ.get('OMP_NUM_THREADS')
         os.environ['OMP_NUM_THREADS'] = '1'
-        mp_context = multiprocessing.get_context('spawn')
-        with mp_context.Pool(processes=max_workers) as pool:
-            for completed, fragment_id in enumerate(
-                    pool.imap_unordered(process_single_fragment_with_result,
-                                        args), start=1):
-                print("片段完成 %d/%d（片段 %d）。" %
-                      (completed, n_fragments, fragment_id + 1), flush=True)
+        try:
+            mp_context = multiprocessing.get_context('spawn')
+            with mp_context.Pool(processes=max_workers) as pool:
+                for completed, fragment_id in enumerate(
+                        pool.imap_unordered(process_single_fragment_with_result,
+                                            args), start=1):
+                    print("片段完成 %d/%d（片段 %d）。" %
+                          (completed, n_fragments, fragment_id + 1), flush=True)
+        finally:
+            if previous_omp_threads is None:
+                os.environ.pop('OMP_NUM_THREADS', None)
+            else:
+                os.environ['OMP_NUM_THREADS'] = previous_omp_threads
     else:
         for fragment_id in range(n_fragments):
             process_single_fragment(fragment_id, color_files, depth_files,

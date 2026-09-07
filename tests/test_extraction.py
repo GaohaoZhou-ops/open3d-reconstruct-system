@@ -239,6 +239,32 @@ class AzureExtractionRoutingTests(unittest.TestCase):
             source, destination, force=True, stride=2
         )
 
+    def test_headless_linux_uses_portable_calibrated_mkv_extractor(self) -> None:
+        from open3d_reconstruct import azure
+
+        source = Path("recording.mkv")
+        destination = Path("dataset")
+        with (
+            mock.patch.object(azure, "SYSTEM", "Linux"),
+            mock.patch.object(azure, "IS_WSL", False),
+            mock.patch.object(azure, "K4A_LIVE_SUPPORTED", True),
+            mock.patch.dict(
+                "open3d_reconstruct.azure.os.environ",
+                {"DISPLAY": "", "WAYLAND_DISPLAY": ""},
+                clear=False,
+            ),
+            mock.patch(
+                "open3d_reconstruct.mkv_portable.extract_mkv_portable",
+                return_value=destination,
+            ) as portable,
+        ):
+            result = azure.extract_mkv(source, destination, stride=4)
+
+        self.assertEqual(result, destination)
+        portable.assert_called_once_with(
+            source, destination, force=False, stride=4
+        )
+
 
 class ExtractionSafetyTests(unittest.TestCase):
     def setUp(self) -> None:

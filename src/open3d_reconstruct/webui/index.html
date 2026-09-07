@@ -378,9 +378,9 @@
       </header>
 
       <div class="preset-grid" role="group" aria-label="重建预设">
-        <button type="button" data-reconstruction-preset="fast"><strong>速度优先</strong><small>抽帧更多 · 快速配准</small></button>
-        <button type="button" class="selected" data-reconstruction-preset="balanced"><strong>均衡</strong><small>推荐 · 兼顾细节与耗时</small></button>
-        <button type="button" data-reconstruction-preset="quality"><strong>质量优先</strong><small>保留每帧 · 更精细</small></button>
+        <button type="button" data-reconstruction-preset="low"><strong>低质量</strong><small>抽帧更多 · 速度优先</small></button>
+        <button type="button" class="selected" data-reconstruction-preset="medium"><strong>中质量</strong><small>推荐 · 兼顾细节与耗时</small></button>
+        <button type="button" data-reconstruction-preset="high"><strong>高质量</strong><small>保留每帧 · 更精细</small></button>
       </div>
 
       <div class="parameter-grid">
@@ -505,7 +505,7 @@
       </details>
 
       <div class="quality-summary">
-        <span id="quality-indicator" class="quality-indicator balanced">均衡</span>
+        <span id="quality-indicator" class="quality-indicator balanced">中质量</span>
         <div><strong id="quality-summary-title">推荐设置</strong><small id="quality-summary-detail">每 2 帧取 1 帧 · 5 cm 配准 · 5.9 mm 融合 · 彩色 ICP</small></div>
       </div>
       <p class="dialog-note">实际耗时取决于录制帧数、场景复杂度与 CPU 性能。IMU 仅用于实时姿态展示，不参与经典 RGB-D 重建。</p>

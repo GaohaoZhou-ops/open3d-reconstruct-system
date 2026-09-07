@@ -1186,6 +1186,7 @@ class WebHttpTests(unittest.TestCase):
         self.assertIn(b"/api/point-cloud/select-local", script)
         self.assertIn(b"fallbackToPoints", script)
         self.assertIn(b"/api/recordings/delete", script)
+        self.assertIn(b"/api/reconstruction/config", script)
         self.assertNotIn(b"function uploadRecording", script)
         self.assertIn(b"wrapRadians(this.pitch", script)
         self.assertIn(b"reconstructionRequest", script)
@@ -1228,6 +1229,15 @@ class WebHttpTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as raised:
                     urllib.request.urlopen(request, timeout=5)
                 self.assertEqual(raised.exception.code, HTTPStatus.CONFLICT)
+
+    def test_reconstruction_profiles_api_comes_from_yaml(self) -> None:
+        payload, _ = self.get("/api/reconstruction/config")
+        configuration = json.loads(payload)["configuration"]
+        self.assertEqual(configuration["source"], "config/reconstruction.yaml")
+        self.assertEqual(configuration["default_profile"], "medium")
+        self.assertEqual(list(configuration["profiles"]), ["low", "medium", "high"])
+        self.assertEqual(configuration["profiles"]["high"]["stride"], 1)
+        self.assertIn("backend", configuration["compute"])
 
     def test_selected_point_cloud_can_be_streamed_and_cleared(self) -> None:
         with tempfile.TemporaryDirectory(

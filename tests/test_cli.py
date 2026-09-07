@@ -46,8 +46,27 @@ class CliCameraTests(unittest.TestCase):
         cpu = self.parser.parse_args(
             ["reconstruct", "dataset", "--compute-backend", "cpu"]
         )
-        self.assertEqual(automatic.compute_backend, "auto")
+        self.assertIsNone(automatic.compute_backend)
         self.assertEqual(cpu.compute_backend, "cpu")
+
+    def test_yaml_profile_and_cloud_commands_are_available(self) -> None:
+        reconstruction = self.parser.parse_args(
+            [
+                "reconstruct",
+                "recording.mkv",
+                "--reconstruction-config",
+                "config/reconstruction.yaml",
+                "--profile",
+                "high",
+            ]
+        )
+        wizard = self.parser.parse_args(["wizard", "--profile", "low", "--yes"])
+        compute = self.parser.parse_args(["gpu-info"])
+        self.assertEqual(reconstruction.profile, "high")
+        self.assertIsNone(reconstruction.stride)
+        self.assertEqual(wizard.profile, "low")
+        self.assertTrue(wizard.yes)
+        self.assertEqual(compute.command, "gpu-info")
 
 
 if __name__ == "__main__":

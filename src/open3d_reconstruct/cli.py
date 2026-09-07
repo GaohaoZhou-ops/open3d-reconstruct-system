@@ -9,6 +9,7 @@ from . import __version__
 from .paths import (
     DATASETS_DIR,
     DEFAULT_RECONSTRUCTION_CONFIG,
+    DEFAULT_RECONSTRUCTION_PROFILES,
     DEFAULT_AZURE_SENSOR_CONFIG,
     DEFAULT_REALSENSE_SENSOR_CONFIG,
     ensure_local_directories,
@@ -84,7 +85,11 @@ def _add_reconstruction_options(parser: argparse.ArgumentParser) -> None:
         "--reconstruction-config",
         type=_path,
         default=DEFAULT_RECONSTRUCTION_CONFIG,
-        help=f"重建 JSON 配置（默认 {DEFAULT_RECONSTRUCTION_CONFIG}）",
+        help=f"重建 JSON/YAML 配置（默认 {DEFAULT_RECONSTRUCTION_CONFIG}）",
+    )
+    parser.add_argument(
+        "--profile",
+        help="多档位 YAML 中的配置名，例如 low、medium 或 high",
     )
     parser.add_argument(
         "--set",
@@ -103,13 +108,13 @@ def _add_reconstruction_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--compute-backend",
         choices=("auto", "cpu", "cuda", "mps"),
-        default="auto",
-        help="重建计算后端；auto 在 Linux 选择 CUDA、在 Apple Silicon 选择 MPS，失败时回退 CPU",
+        default=None,
+        help="重建计算后端；默认读取配置，未设置时为 auto",
     )
     parser.add_argument(
         "--compute-device",
-        default="CPU:0",
-        help="仅用于 Open3D SLAC 的设备，例如 CPU:0 或 CUDA:0",
+        default=None,
+        help="仅用于 Open3D SLAC 的设备，例如 CPU:0 或 CUDA:0；默认读取配置",
     )
 
 
@@ -164,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-extract", action="store_true", help="强制重新提取录制文件"
     )
     reconstruct_parser.add_argument(
-        "--stride", type=int, default=1, help="提取时每 N 帧保留一帧"
+        "--stride", type=int, help="提取时每 N 帧保留一帧；默认读取 YAML，或使用 1"
     )
     _add_reconstruction_options(reconstruct_parser)
 
@@ -181,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     color_parser.add_argument(
         "--reconstruction-config", type=_path, default=DEFAULT_RECONSTRUCTION_CONFIG
     )
+    color_parser.add_argument("--profile", help="多档位 YAML 中的配置名")
     color_parser.add_argument("--set", dest="overrides", action="append", default=[])
     color_parser.add_argument("--sample-rate", type=int, default=10, help="关键帧采样间隔")
     color_parser.add_argument("--visualize", action="store_true", help="显示优化前后的窗口")
@@ -209,6 +215,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet", action="store_true", help="不输出状态文本，只返回状态码"
     )
     service_commands.add_parser("stop", help="安全停止服务及当前相机任务")
+
+    wizard_parser = subparsers.add_parser(
+        "wizard", help="无桌面云服务器的逐步交互重建向导"
+    )
+    wizard_parser.add_argument("--input", type=_path, help="预先指定 MKV、BAG 或数据集")
+    wizard_parser.add_argument(
+        "--config",
+        "--reconstruction-config",
+        dest="reconstruction_config",
+        type=_path,
+        default=DEFAULT_RECONSTRUCTION_PROFILES,
+        help=f"多档位 YAML 配置（默认 {DEFAULT_RECONSTRUCTION_PROFILES}）",
+    )
+    wizard_parser.add_argument("--profile", help="预先指定 YAML 档位")
+    wizard_parser.add_argument(
+        "--yes", action="store_true", help="显示摘要后直接执行，不再询问确认"
+    )
+
+    compute_parser = subparsers.add_parser(
+        "compute-info", aliases=("gpu-info",), help="检测 CPU/CUDA/MPS 重建后端"
+    )
+    compute_parser.add_argument(
+        "--backend",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="检查指定的后端选择（默认 auto）",
+    )
 
     udev_parser = subparsers.add_parser(
         "udev-install",
@@ -259,7 +292,12 @@ def _extract_recording(
     raise ValueError(f"无法识别录制格式（只支持 .mkv/.bag）: {source}")
 
 
-def _run_reconstruction(args: argparse.Namespace, dataset: Path) -> Path | None:
+def _run_reconstruction(
+    args: argparse.Namespace,
+    dataset: Path,
+    plan=None,
+    stride: int | None = None,
+) -> Path | None:
     from .configuration import build_reconstruction_config
     from .pipeline import parse_stages, run_pipeline
 
@@ -273,8 +311,18 @@ def _run_reconstruction(args: argparse.Namespace, dataset: Path) -> Path | None:
         single_thread=args.single_thread,
         device=args.compute_device,
         compute_backend=args.compute_backend,
+        profile=args.profile,
+        plan=plan,
     )
-    return run_pipeline(config, parse_stages(args.stages))
+    if plan is not None:
+        config["reconstruction_config_source"] = str(plan.source)
+        config["reconstruction_profile"] = plan.profile
+    if stride is not None:
+        config["frame_stride"] = stride
+    stages = parse_stages(args.stages) if args.stages else (
+        plan.stages if plan is not None else parse_stages(None)
+    )
+    return run_pipeline(config, stages)
 
 
 def dispatch(args: argparse.Namespace) -> int:
@@ -319,15 +367,22 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "reconstruct":
+        from .configuration import load_reconstruction_plan
+
+        plan = load_reconstruction_plan(args.reconstruction_config, args.profile)
+        stride = args.stride if args.stride is not None else plan.stride
         dataset = _dataset_for_input(
             args.input,
             args.dataset,
             force_extract=args.force_extract,
-            stride=args.stride,
+            stride=stride,
         )
-        _run_reconstruction(args, dataset)
+        _run_reconstruction(args, dataset, plan, stride)
         return 0
     if args.command == "scan":
+        from .configuration import load_reconstruction_plan
+
+        plan = load_reconstruction_plan(args.reconstruction_config, args.profile)
         backend = _backend(args.camera)
         recording = backend.default_recording_path(args.name)
         dataset = DATASETS_DIR / recording.stem
@@ -340,19 +395,24 @@ def dispatch(args: argparse.Namespace) -> int:
             align_depth_to_color=not args.unaligned,
             force=args.force,
         )
-        dataset = _extract_recording(recording, dataset, force=args.force, stride=1)
-        _run_reconstruction(args, dataset)
+        dataset = _extract_recording(
+            recording, dataset, force=args.force, stride=plan.stride
+        )
+        _run_reconstruction(args, dataset, plan, plan.stride)
         return 0
     if args.command == "color-map":
-        from .configuration import build_reconstruction_config
+        from .configuration import build_reconstruction_config, load_reconstruction_plan
         from .pipeline import run_color_map
 
         dataset = args.dataset.expanduser().resolve()
+        plan = load_reconstruction_plan(args.reconstruction_config, args.profile)
         config = build_reconstruction_config(
             dataset,
             dataset / "intrinsic.json",
             args.reconstruction_config,
             args.overrides,
+            profile=args.profile,
+            plan=plan,
         )
         run_color_map(config, sample_rate=args.sample_rate, visualize=args.visualize)
         return 0
@@ -370,6 +430,20 @@ def dispatch(args: argparse.Namespace) -> int:
         if args.service_command == "stop":
             return stop_service()
         raise AssertionError(f"未处理的服务命令: {args.service_command}")
+    if args.command == "wizard":
+        from .cloud import run_cloud_wizard
+
+        return run_cloud_wizard(
+            source=args.input,
+            config_path=args.reconstruction_config,
+            profile=args.profile,
+            assume_yes=args.yes,
+        )
+    if args.command in {"compute-info", "gpu-info"}:
+        from .compute import print_compute_readiness
+
+        print_compute_readiness(args.backend)
+        return 0
     if args.command == "udev-install":
         from .permissions import install_udev_rules
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 from pathlib import Path
 
@@ -16,6 +17,31 @@ from .paths import (
 
 
 RECORDING_EXTENSION = ".mkv"
+MKV_BACKEND_ENVIRONMENT = "OPEN3D_RECONSTRUCT_MKV_BACKEND"
+
+
+class _NativeAlignmentUnavailable(RuntimeError):
+    pass
+
+
+def _use_portable_mkv_backend() -> bool:
+    requested = os.environ.get(MKV_BACKEND_ENVIRONMENT, "auto").strip().lower()
+    if requested not in {"auto", "native", "portable"}:
+        raise ValueError(
+            f"{MKV_BACKEND_ENVIRONMENT} 必须是 auto、native 或 portable"
+        )
+    if requested == "portable":
+        return True
+    if requested == "native":
+        return False
+    # K4A's native offline alignment starts a transform engine that needs a
+    # working graphical context.  Headless Linux compute containers normally
+    # have neither X11 nor Wayland, even when CUDA is attached.  The calibrated
+    # FFmpeg path is deterministic and does not need a display server.
+    headless_linux = SYSTEM == "Linux" and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+    return not K4A_LIVE_SUPPORTED or IS_WSL or headless_linux
 
 
 def _require_live_capture() -> None:
@@ -276,7 +302,7 @@ def extract_mkv(
     # record raw MKV streams through USB forwarding, but its graphics bridge
     # does not reliably satisfy that offline depth-alignment requirement. Use
     # the calibration-based software extractor that is also used on macOS.
-    if not K4A_LIVE_SUPPORTED or IS_WSL:
+    if _use_portable_mkv_backend():
         from .mkv_portable import extract_mkv_portable
 
         return extract_mkv_portable(
@@ -329,6 +355,7 @@ def extract_mkv(
     saved = 0
     seen = 0
     started = time.monotonic()
+    fallback_reason: str | None = None
     try:
         metadata = reader.get_metadata()
         intrinsic_path = partial / "intrinsic.json"
@@ -338,6 +365,16 @@ def extract_mkv(
             rgbd = reader.next_frame()
             if rgbd is None:
                 continue
+            if saved == 0:
+                import numpy as np
+
+                color_shape = np.asarray(rgbd.color).shape[:2]
+                depth_shape = np.asarray(rgbd.depth).shape[:2]
+                if color_shape != depth_shape:
+                    raise _NativeAlignmentUnavailable(
+                        "K4A 原生深度变换没有生成对齐帧："
+                        f"color={color_shape}, depth={depth_shape}"
+                    )
             current = seen
             seen += 1
             if current % stride:
@@ -351,8 +388,21 @@ def extract_mkv(
             saved += 1
             if saved % 30 == 0:
                 print(f"已提取 {saved} 帧……")
+    except _NativeAlignmentUnavailable as exc:
+        fallback_reason = str(exc)
     finally:
         reader.close()
+
+    if fallback_reason is not None:
+        print(f"{fallback_reason}；自动改用 FFmpeg 工厂标定软件对齐后端。")
+        from .mkv_portable import extract_mkv_portable
+
+        return extract_mkv_portable(
+            source,
+            destination,
+            force=True,
+            stride=stride,
+        )
 
     if saved == 0:
         raise RuntimeError("MKV 中没有可读取的同步 RGB-D 帧")
@@ -361,7 +411,12 @@ def extract_mkv(
         frame_count=saved,
         source_frame_count=seen,
         depth_scale=1000.0,
-        manifest_extra={"source_format": "MKV", "camera": "azure-kinect"},
+        manifest_extra={
+            "source_format": "MKV",
+            "camera": "azure-kinect",
+            "extraction_backend": "open3d-k4a-native",
+            "alignment": "depth-to-color",
+        },
     )
     elapsed = max(time.monotonic() - started, 1e-9)
     print(f"提取完成：{destination}（{saved} 帧，{elapsed:.1f} 秒）")

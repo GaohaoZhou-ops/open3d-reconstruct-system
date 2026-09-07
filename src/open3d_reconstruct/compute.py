@@ -77,13 +77,30 @@ def probe_compute_backends(
             else None
         ),
         "import_error": import_error,
-        "cuda": {"available": False, "detail": "不可用"},
+        "cuda": {
+            "available": False,
+            "detail": "不可用",
+            "compiled_version": None,
+            "device_count": 0,
+            "devices": [],
+        },
         "mps": {"available": False, "detail": "不可用"},
     }
     if torch is None:
         return result
 
     cuda_available = _safe_bool(torch.cuda.is_available)
+    cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+    try:
+        cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
+    except Exception:
+        cuda_count = 1 if cuda_available else 0
+    cuda_devices: list[str] = []
+    for index in range(cuda_count):
+        try:
+            cuda_devices.append(str(torch.cuda.get_device_name(index)))
+        except Exception:
+            cuda_devices.append(f"CUDA:{index}")
     cuda_detail = "未检测到 CUDA GPU"
     if cuda_available:
         try:
@@ -91,7 +108,15 @@ def probe_compute_backends(
             cuda_detail = str(torch.cuda.get_device_name(index))
         except Exception:
             cuda_detail = "CUDA GPU"
-    result["cuda"] = {"available": cuda_available, "detail": cuda_detail}
+    elif cuda_version:
+        cuda_detail = f"PyTorch 包含 CUDA {cuda_version}，但容器当前看不到 GPU"
+    result["cuda"] = {
+        "available": cuda_available,
+        "detail": cuda_detail,
+        "compiled_version": str(cuda_version) if cuda_version else None,
+        "device_count": cuda_count,
+        "devices": cuda_devices,
+    }
 
     mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
     mps_built = bool(mps_backend and _safe_bool(mps_backend.is_built))
@@ -172,4 +197,41 @@ def configure_compute_backend(config: dict[str, Any]) -> ComputeSelection:
     config["compute_backend_device"] = selection.device
     config["compute_accelerated"] = selection.accelerated
     config["compute_backend_detail"] = selection.detail
+    return selection
+
+
+def compute_readiness_report(requested: object = "auto") -> dict[str, Any]:
+    """Return stable, serializable diagnostics for cloud GPU attachment checks."""
+
+    probe = probe_compute_backends()
+    selection = resolve_compute_backend(requested)
+    return {
+        "probe": probe,
+        "selection": selection.to_dict(),
+        "accelerated_stages": ["RGB-D 连续帧里程计"] if selection.accelerated else [],
+        "cpu_stages": ["闭环初始化", "全局配准", "精细 ICP", "经典 TSDF 融合"],
+    }
+
+
+def print_compute_readiness(requested: object = "auto") -> ComputeSelection:
+    report = compute_readiness_report(requested)
+    probe = report["probe"]
+    selection = ComputeSelection(**report["selection"])
+    cuda = probe["cuda"]
+    mps = probe["mps"]
+    print(f"平台: {probe['platform']} / {probe['machine']}")
+    print(
+        "PyTorch: "
+        + (str(probe["torch_version"]) if probe["torch_available"] else "不可用")
+    )
+    print(
+        f"CUDA: {'可用' if cuda['available'] else '不可用'}；{cuda['detail']}"
+    )
+    if cuda.get("compiled_version"):
+        print(f"CUDA 编译版本: {cuda['compiled_version']}")
+    if cuda.get("devices"):
+        print("GPU: " + "，".join(cuda["devices"]))
+    print(f"MPS: {'可用' if mps['available'] else '不可用'}；{mps['detail']}")
+    print(f"自动选择: {selection.backend.upper()}；{selection.detail}")
+    print("GPU 加速范围: RGB-D 连续帧里程计；其余经典 Open3D 阶段保留 CPU 路径。")
     return selection

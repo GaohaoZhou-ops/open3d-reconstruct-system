@@ -10,7 +10,8 @@ SLAC 与颜色映射优化。
 
 ## 当前状态
 
-- 目标系统：Windows x64、Ubuntu/WSL2 x86_64、macOS arm64/x86_64
+- 目标系统：Windows x64、Ubuntu/WSL2 x86_64、无头 Linux x86_64 云容器、
+  macOS arm64/x86_64
 - Python：项目内 CPython 3.12；Linux/macOS 使用 `.venv`，Windows 使用独立的
   `.venv-windows`
 - Open3D：0.19.0；Windows/Linux 使用官方 x86_64 wheel，macOS 使用官方
@@ -23,8 +24,9 @@ SLAC 与颜色映射优化。
 - RealSense：Open3D wheel 内置 librealsense，无需系统 SDK 或 `pyrealsense2`；macOS
   的实时 USB 支持受上游限制，WSL2 需要先把 USB 设备转接给发行版
 - D435/D435i：设备枚举、预览、BAG 录制、暂停/继续、提取与一键重建均已接入
-- Web 控制台：录制时实时显示 RGB、深度伪彩和 IMU 三维姿态，重建前可选择速度/质量
-  参数，重建时显示阶段心跳、输入帧与局部 PLY；全部使用本机 11920 单口
+- Web 控制台：录制时实时显示 RGB、深度伪彩和 IMU 三维姿态；重建前可选择由
+  `config/reconstruction.yaml` 提供的低/中/高质量参数，重建时显示阶段心跳、输入帧与
+  局部 PLY；全部使用本机 11920 单口
 - 无设备单元测试和四阶段合成 RGB-D 重建自检：Windows、WSL2、Ubuntu、macOS 已通过
 - macOS 示例 `data/recordings/web-20260903-105959.mkv`：125 帧提取和四阶段重建已通过
 - WSL2 同一示例：静态 FFmpeg 软件标定提取 63 帧（stride 2）及四阶段 CPU 重建已通过，
@@ -156,6 +158,95 @@ RealSense 的 librealsense 已静态集成在对应虚拟环境的 Open3D wheel 
 Python 与 Python 包仍保持项目内隔离。Windows 相机驱动与 WSL2 的 USB 转接属于系统
 基础设施，不由项目安装器静默修改。
 
+## 无头云服务器
+
+云端仍使用原有安装器和服务脚本，不需要系统 Python，也不要求 X11、Wayland 或桌面
+文件选择器：
+
+```bash
+./setup.sh
+./open3d-reconstruct compute-info
+./cloud-reconstruct.sh
+```
+
+`cloud-reconstruct.sh` 只有四步：选择 MKV/BAG 或已提取数据集、选择低/中/高质量、查看
+自动检测到的计算后端、确认开始。它同时识别标准的 `data/recordings/` 和早期部署使用的
+`data/recording/`。录制文件的三档输出分别使用 `-low`、`-medium`、`-high` 后缀，互不
+覆盖；再次运行相同输入和档位时会复用校验通过的提取帧。
+
+也可预先给出部分选项，仍由向导展示完整摘要：
+
+```bash
+./cloud-reconstruct.sh \
+  --input data/recording/web-20260903-105959.mkv \
+  --profile medium
+```
+
+`--yes` 可用于已经由上层作业系统确认过的非交互任务。普通 Linux 云容器没有图形上下文
+时，Azure Kinect MKV 会自动使用项目内静态 FFmpeg 和录像中的工厂标定做软件对齐；
+桌面 Linux 保留 K4A 原生后端。仅调试时可用环境变量
+`OPEN3D_RECONSTRUCT_MKV_BACKEND=portable|native|auto` 覆盖自动选择。
+
+云主机暴露很多 vCPU 时，单片段 Open3D 任务会自动放到一个线程数受控的子进程中，避免
+原生数值库按全部 vCPU 过度订阅。普通桌面规模的 CPU、显式单线程模式和 CUDA/MPS 路径
+均保留原调度方式。
+
+后台 Web 服务仍由原脚本控制，起停逻辑和本地绑定没有改变：
+
+```bash
+./start-service.sh
+./status-service.sh
+./stop-service.sh
+```
+
+从自己的电脑访问云端页面时，建议使用 SSH 端口转发，不必把无认证控制接口暴露到公网：
+
+```bash
+ssh -N -L 11920:127.0.0.1:11920 user@cloud-host
+```
+
+然后在本机打开 [http://127.0.0.1:11920](http://127.0.0.1:11920)。
+
+### YAML 重建参数
+
+跨平台配置位于 `config/reconstruction.yaml`。Web 参数弹窗通过同端口接口读取这个文件，
+终端向导和普通命令行也使用同一个解析器与校验规则，因此页面和 YAML 不会出现两套参数
+含义。默认三档如下：
+
+| profile | 抽帧 | 配准体素 | TSDF 融合体素 | ICP | 全局配准 |
+| --- | ---: | ---: | ---: | --- | --- |
+| `low` | 4 | 8 cm | 10 mm | 点到平面 | FGR |
+| `medium` | 2 | 5 cm | 5.9 mm | 彩色 ICP | RANSAC |
+| `high` | 1 | 3 cm | 4 mm | 彩色 ICP | RANSAC |
+
+文件还包含深度范围、片段帧数、关键帧间隔、深度差阈值、SDF 截断距离、回环偏好、
+执行阶段和计算后端。修改 YAML 后重启 Web 服务即可让页面预设同步更新。直接使用 YAML：
+
+```bash
+./open3d-reconstruct reconstruct data/recordings/room.mkv \
+  --reconstruction-config config/reconstruction.yaml \
+  --profile high
+```
+
+命令行 `--set KEY=VALUE` 仍具有最高优先级；原有扁平
+`config/reconstruction.json` 和既有命令均继续兼容。每次任务采用的 YAML 路径、profile、
+stride、最终计算后端和完整参数都会写入数据集的 `effective-config.json`，阶段耗时与网格
+统计写入 `run-report.json`。
+
+### 当前云容器样例验收
+
+在 2026-09-05 的 128 vCPU、未挂载 GPU 的无头 Linux 容器中，仓库样例
+`data/recording/web-20260903-105959.mkv` 已完成三档四阶段 CPU 重建：
+
+| 档位 | 对齐帧 | 提取 | make | integrate | 网格顶点 / 三角形 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| low | 32 | 1.4 s | 13.3 s | 11.5 s | 115,829 / 172,654 |
+| medium | 63 | 3.1 s | 41.8 s | 38.6 s | 337,761 / 558,678 |
+| high | 125 | 4.0 s | 200.3 s | 59.9 s | 651,219 / 1,117,281 |
+
+三档提取清单均记录 `ffmpeg-calibrated` 软件标定后端，最终报告均记录当前因 GPU 不可见
+而选择 `cpu`。数字用于验证执行路径和产物，不应视为不同硬件之间的固定性能承诺。
+
 ## Web 可视化控制台
 
 推荐使用后台单例服务脚本启动：
@@ -225,7 +316,7 @@ Windows、WSL2 与 macOS 上“打开本地录制”和“加载其他点云”�
    上传或复制整段视频；完成后直接进入重建参数确认。Windows 普通用户创建跨卷文件
    符号链接需要开启“开发人员模式”；未开启时请把录像放到项目所在 NTFS 卷，或通过
    页面上传导入。
-3. 点击“开始重建”会先弹出参数确认窗口，可选择速度优先、均衡或质量优先，也可分别
+3. 点击“开始重建”会先弹出参数确认窗口，可选择低、中或高质量，也可分别
    调整帧采样、配准体素、深度范围、全局配准、片段长度、关键帧间隔、ICP 方法、
    深度差阈值、TSDF 融合体素、SDF 截断距离及片内/片段回环偏好。
    提取阶段会显示最新 RGB-D 帧；进入 `make` 后切换为真实帧对匹配热力图和信息矩阵
@@ -400,6 +491,7 @@ Metal/MPS；没有可用 GPU、PyTorch 无法加载，或 GPU 里程计在运行
 
 ```bash
 ./open3d-reconstruct doctor
+./open3d-reconstruct compute-info
 ```
 
 也可以显式选择或禁用 GPU：
@@ -416,6 +508,11 @@ GPU 路径使用同一套 Torch 张量实现，在 CUDA 与 MPS 上执行 Open3D
 融合仍由 CPU/Open3D 完成。因此 GPU 会降低连续帧里程计的 CPU 占用，但端到端收益会
 随分辨率、深度有效像素、片段数量、闭环候选数量和具体 M 系列/NVIDIA GPU 而变化。
 所有 M 系列使用相同的 MPS 代码路径，不需要按 M1、M2、M3、M4 分别编译。
+
+Linux 安装锁中已经包含 CUDA 版 PyTorch；云容器挂载 NVIDIA GPU 后无需修改 YAML。
+先确认容器内 `nvidia-smi` 能列出设备，再运行 `compute-info`：输出从“容器当前看不到
+GPU / CPU 回退”变为“CUDA 已启用”即可开始联合验证。若 CUDA 算子运行时失败，任务会
+记录原因并自动回退到原 Open3D CPU 里程计，不会把半成品误报为 GPU 成功。
 
 运行结束后，实际选择的设备会记录在数据集的 `effective-config.json` 和
 `run-report.json` 中。`--compute-device` 是上游 SLAC 流程的独立参数，不控制本节的
